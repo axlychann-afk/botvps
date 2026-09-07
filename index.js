@@ -33,6 +33,7 @@ const config = {
   // Default ke endpoint resmi zakki.store (GET ?idtopup=...).
   // Bisa dioverride pakai endpoint custom POST { token, reference }.
   statusUrl: process.env.QRIS_STATUS_URL || 'https://qris.zakki.store/cektopup',
+  cancelUrl: process.env.QRIS_CANCEL_URL || 'https://qris.zakki.store/cancel',
   pollSeconds: Number(process.env.PAYMENT_POLL_SECONDS || 15),
   timeoutMinutes: Number(process.env.PAYMENT_TIMEOUT_MINUTES || 10),
 };
@@ -221,6 +222,19 @@ async function checkPayment(order) {
   return paid(body);
 }
 
+// Batalkan tiket QRIS pending di zakki.store: GET /cancel?token=...&id_transaksi=...
+async function cancelPayment(order) {
+  const reference = order.reference;
+  if (!reference) return true;
+  const url = `${config.cancelUrl}${config.cancelUrl.includes('?') ? '&' : '?'}token=${encodeURIComponent(config.qrisToken)}&id_transaksi=${encodeURIComponent(reference)}`;
+  const response = await fetch(url, { method: 'GET' });
+  const body = await response.json().catch(() => ({}));
+  // 404 = sudah tidak ada / kadaluarsa -> anggap sudah batal
+  if (response.status === 404) return true;
+  if (!response.ok) throw new Error(body.message || `Cancel QRIS HTTP ${response.status}`);
+  return true;
+}
+
 function isExpired(order) {
   if (order.expiredAt) {
     const t = Date.parse(order.expiredAt);
@@ -271,6 +285,10 @@ async function verifyAndDeliver(ctx, id, { auto = false } = {}) {
   if (order.status === 'delivered') {
     if (!auto) await ctx.answerCbQuery('Data sudah dikirim.');
     return true;
+  }
+  if (order.status === 'cancelled') {
+    if (!auto) await ctx.answerCbQuery('Pesanan sudah dibatalkan.');
+    return false;
   }
   if (order.status === 'expired' || isExpired(order)) {
     order.status = 'expired';
@@ -385,14 +403,17 @@ bot.action('buy', async (ctx) => {
     startPolling(order.id);
 
     const expiredInfo = qris.expiredAt
-      ? `\n⏰ Bayar sebelum: ${new Date(qris.expiredAt).toLocaleString('id-ID')}`
-      : `\n⏰ Batas: ${config.timeoutMinutes} menit`;
+      ? `⏰ Bayar sebelum: ${new Date(qris.expiredAt).toLocaleString('id-ID')}`
+      : `⏰ Batas: ${config.timeoutMinutes} menit`;
+    // Foto aja: caption singkat tanpa string QRIS panjang
     const caption =
-      `Bayar ${formatRupiah(qris.total)} (total sudah termasuk kode unik) melalui QRIS ini:\n\n` +
-      `Reference: ${qris.reference}` +
-      expiredInfo +
-      (qris.content ? `\n\nQRIS string:\n${qris.content.slice(0, 500)}` : '') +
-      (qris.cancelUrl ? `\n\nBatal: ${qris.cancelUrl}` : '');
+      `Bayar ${formatRupiah(qris.total)} (total sudah termasuk kode unik) lewat QR di foto ini.\n\n` +
+      `Reference: ${qris.reference}\n` +
+      expiredInfo;
+    const buttons = Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Cek pembayaran', `check:${order.id}`)],
+      [Markup.button.callback('❌ Batalkan pembayaran', `cancel:${order.id}`)],
+    ]);
 
     // Kirim QR sebagai foto biar bisa discan, fallback ke teks kalau gagal
     try {
@@ -400,13 +421,13 @@ bot.action('buy', async (ctx) => {
         { url: qris.image },
         {
           caption: caption.slice(0, 1000),
-          ...Markup.inlineKeyboard([[Markup.button.callback('Cek pembayaran', `check:${order.id}`)]]),
+          ...buttons,
         }
       );
     } catch {
       await ctx.reply(
         `${caption}\n\nQR: ${qris.image}`,
-        Markup.inlineKeyboard([[Markup.button.callback('Cek pembayaran', `check:${order.id}`)]])
+        buttons
       );
     }
     await ctx.answerCbQuery();
@@ -422,6 +443,42 @@ bot.action(/^check:(.+)$/, async (ctx) => {
   } catch (error) {
     await ctx.answerCbQuery('Gagal cek pembayaran.');
     await ctx.reply(`Gagal: ${error.message}`);
+  }
+});
+
+bot.action(/^cancel:(.+)$/, async (ctx) => {
+  try {
+    const orders = await readJson(ordersFile);
+    const order = orders[ctx.match[1]];
+    const chatId = getChatId(ctx);
+    if (!order || (chatId && order.chatId !== chatId)) return ctx.answerCbQuery('Pesanan tidak ditemukan.');
+    if (order.status === 'delivered') return ctx.answerCbQuery('Data sudah dikirim, tidak bisa dibatalkan.');
+    if (order.status === 'cancelled') return ctx.answerCbQuery('Pesanan sudah dibatalkan.');
+    // Kalau ternyata sudah bayar, langsung kirim VPS daripada dibatalkan
+    try {
+      if (await checkPayment(order)) {
+        await verifyAndDeliver(ctx, order.id);
+        return;
+      }
+    } catch {}
+    try {
+      await cancelPayment(order);
+    } catch (e) {
+      await ctx.answerCbQuery('Gagal batalkan.');
+      await ctx.reply(`Gagal batal: ${e.message}`).catch(() => {});
+      return;
+    }
+    order.status = 'cancelled';
+    await writeJson(ordersFile, orders);
+    stopPolling(order.id);
+    try {
+      await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+    } catch {}
+    await ctx.answerCbQuery('Pembayaran dibatalkan.');
+    await ctx.reply('❌ Pembayaran dibatalkan. Silakan buat pesanan baru dengan /start kalau mau beli lagi.').catch(() => {});
+  } catch (error) {
+    await ctx.answerCbQuery('Gagal batalkan.');
+    await ctx.reply(`Gagal: ${error.message}`).catch(() => {});
   }
 });
 
