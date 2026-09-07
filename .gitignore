@@ -1,0 +1,4 @@
+node_modules/
+.env
+data/orders.json
+data/vps_stock.json
