@@ -974,6 +974,31 @@ bot.command('riwayat', async (ctx) => {
   await ctx.reply(`🧾 ${list.length} order terakhir:\n\n${lines.join('\n\n').slice(0, 3500)}`);
 });
 
+// Format: /tambahsaldo <id_telegram> <nominal>  (contoh: /tambahsaldo 123456 10000)
+bot.command('tambahsaldo', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const args = (ctx.message?.text || '').replace(/^\/tambahsaldo(@\w+)?/, '').trim().split(/\s+/).filter(Boolean);
+  if (args.length < 2) {
+    await ctx.reply('Format:\n/tambahsaldo <id_telegram> <nominal>\nContoh: /tambahsaldo 123456 10000');
+    return;
+  }
+  const targetId = args[0].replace(/[^0-9]/g, '');
+  const nominal = Math.floor(Number(args[1]));
+  if (!targetId || !Number.isFinite(nominal) || nominal <= 0) {
+    await ctx.reply('ID / nominal tidak valid. Contoh: /tambahsaldo 123456 10000');
+    return;
+  }
+  const users = await readJson(usersFile);
+  const u = users[targetId] || { balance: 0 };
+  u.balance = (Number(u.balance) || 0) + nominal;
+  users[targetId] = u;
+  await writeJson(usersFile, users);
+  await ctx.reply(`✅ Saldo ${targetId} +${formatRupiah(nominal)}. Sekarang: ${formatRupiah(u.balance)}`);
+  try {
+    await bot.telegram.sendMessage(targetId, `💰 Admin menambah saldo kamu +${formatRupiah(nominal)}.\n💳 Saldo sekarang: ${formatRupiah(u.balance)}`);
+  } catch {}
+});
+
 // ---- Start ----
 try {
   await ensureData();
