@@ -1,1 +1,18 @@
-
+[
+  {
+    "ip": "66.33.22.253",
+    "port": "40681",
+    "username": "root",
+    "password": "GANTI_PASSWORD_1",
+    "os": "Ubuntu 24.04.4 LTS",
+    "status": "ACTIVE"
+  },
+  {
+    "ip": "66.33.22.254",
+    "port": "40682",
+    "username": "root",
+    "password": "GANTI_PASSWORD_2",
+    "os": "Ubuntu 24.04.4 LTS",
+    "status": "ACTIVE"
+  }
+]
