@@ -26,6 +26,7 @@ if (!String(process.env.BOT_TOKEN).includes(':')) {
 }
 
 const PRICE = Number(process.env.PRICE || 1000);
+const UNIT_PRICE = Math.round(PRICE / 2);
 
 const config = {
   qrisToken: process.env.QRIS_TOKEN,
@@ -36,6 +37,9 @@ const config = {
   cancelUrl: process.env.QRIS_CANCEL_URL || 'https://qris.zakki.store/cancel',
   pollSeconds: Number(process.env.PAYMENT_POLL_SECONDS || 15),
   timeoutMinutes: Number(process.env.PAYMENT_TIMEOUT_MINUTES || 10),
+  // Total kapasitas stok untuk bar persen. Isi mis. 102. Kalau 0/kosong, total = sisa saat ini.
+  stockTotal: Number(process.env.STOCK_TOTAL || 0),
+  productSpec: process.env.PRODUCT_SPEC || 'NAT | Unlimited',
 };
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -371,12 +375,68 @@ function formatRupiah(n) {
   return `Rp${Number(n || PRICE).toLocaleString('id-ID')}`;
 }
 
-bot.start((ctx) =>
-  ctx.reply(
-    `Jual VPS NAT\n${formatRupiah(PRICE)} = 2 VPS NAT`,
-    Markup.inlineKeyboard([[Markup.button.callback(`Beli 2 VPS — ${formatRupiah(PRICE)}`, 'buy')]])
-  )
-);
+async function getStockCount() {
+  try {
+    const stock = await readJson(stockFile);
+    return Array.isArray(stock) ? stock.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function stockBar(percent) {
+  const filled = Math.max(0, Math.min(10, Math.round(percent / 10)));
+  return '■'.repeat(filled) + '□'.repeat(10 - filled);
+}
+
+// Tampilan /start gaya auto-order dengan stok live.
+// Kalau stok < 2, tombol beli diganti tombol refresh (order diblokir di action 'buy' juga).
+async function buildStart(name) {
+  const remaining = await getStockCount();
+  const total = config.stockTotal > 0 ? config.stockTotal : Math.max(remaining, 1);
+  const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
+  const empty = remaining < 2;
+  const text =
+    `ᴀᴜᴛᴏ ᴏʀᴅᴇʀ VPS NAT • ᴄᴇᴘᴀᴛ & ᴛᴇʀᴘᴇʀᴄᴀʏᴀ\n` +
+    `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n\n` +
+    `👋 ʜᴀʟᴏ, ${name}!\n` +
+    `sᴇʟᴀᴍᴀᴛ ᴅᴀᴛᴀɴɢ ᴅɪ ʙᴏᴛ ᴀᴜᴛᴏ ᴏʀᴅᴇʀ ᴋᴀᴍɪ 🚀\n\n` +
+    `💰 sᴀʟᴅᴏ ᴀɴᴅᴀ: ʀᴘ0\n\n` +
+    `📦 ɪɴꜰᴏ ᴘʀᴏᴅᴜᴋ\n` +
+    `├ ᴘʀᴏᴅᴜᴋ : VPS NAT\n` +
+    `├ ʜᴀʀɢᴀ : ${formatRupiah(UNIT_PRICE)} / ᴜɴɪᴛ\n` +
+    `├ ᴍɪɴɪᴍᴀʟ : 2 ᴜɴɪᴛ\n` +
+    `└ sᴘᴇsɪꜰɪᴋᴀsɪ : ${config.productSpec}\n\n` +
+    `📊 sᴛᴏᴋ ᴛᴇʀsᴇᴅɪᴀ\n` +
+    `├ ${stockBar(percent)} ${percent}%\n` +
+    `└ sɪsᴀ : ${remaining} / ${total} ᴜɴɪᴛ\n` +
+    (empty ? `\n❌ sᴛᴏᴋ ʜᴀʙɪs — ᴄᴏʙᴀ ʟᴀɢɪ ɴᴀɴᴛɪ.\n` : ``) +
+    `\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
+    `⚡️ ᴘʀᴏsᴇs ᴏᴛᴏᴍᴀᴛɪs sᴇᴛᴇʟᴀʜ ᴘᴇᴍʙᴀʏᴀʀᴀɴ\n` +
+    `🔒 ᴀᴍᴀɴ, ᴄᴇᴘᴀᴛ & ᴛᴇʀᴘᴇʀᴄᴀʏᴀ\n\n` +
+    `👇 ᴋʟɪᴋ ᴛᴏᴍʙᴏʟ ᴅɪ ʙᴀᴡᴀʜ ʙᴜᴀᴛ ᴍᴜʟᴀɪ ᴏʀᴅᴇʀ!`;
+  const buttons = empty
+    ? Markup.inlineKeyboard([[Markup.button.callback('🔄 Cek Stok', 'cek_stok')]])
+    : Markup.inlineKeyboard([[Markup.button.callback(`🛒 Beli 2 VPS — ${formatRupiah(PRICE)}`, 'buy')]]);
+  return { text, buttons };
+}
+
+bot.start(async (ctx) => {
+  const name = ctx.from?.first_name || 'kak';
+  const { text, buttons } = await buildStart(name);
+  await ctx.reply(text, buttons);
+});
+
+bot.action('cek_stok', async (ctx) => {
+  try {
+    const name = ctx.from?.first_name || 'kak';
+    const { text, buttons } = await buildStart(name);
+    await ctx.answerCbQuery();
+    await ctx.reply(text, buttons);
+  } catch {
+    await ctx.answerCbQuery('Gagal cek stok.');
+  }
+});
 
 bot.action('buy', async (ctx) => {
   try {
@@ -415,18 +475,30 @@ bot.action('buy', async (ctx) => {
       [Markup.button.callback('❌ Batalkan pembayaran', `cancel:${order.id}`)],
     ]);
 
-    // Kirim QR sebagai foto biar bisa discan, fallback ke teks kalau gagal
+    // Foto aja, tanpa link: gambar di-download server lalu di-upload sebagai file,
+    // jadi Telegram tidak perlu fetch URL host gambar (sering gagal).
+    const photoOpts = {
+      caption: caption.slice(0, 1000),
+      ...buttons,
+    };
+    let sent = false;
     try {
-      await ctx.replyWithPhoto(
-        { url: qris.image },
-        {
-          caption: caption.slice(0, 1000),
-          ...buttons,
-        }
-      );
-    } catch {
+      const imgRes = await fetch(qris.image);
+      if (!imgRes.ok) throw new Error(`Gambar HTTP ${imgRes.status}`);
+      const buf = Buffer.from(await imgRes.arrayBuffer());
+      if (!buf.length) throw new Error('Gambar kosong');
+      await ctx.replyWithPhoto({ source: buf }, photoOpts);
+      sent = true;
+    } catch {}
+    if (!sent) {
+      try {
+        await ctx.replyWithPhoto({ url: qris.image }, photoOpts);
+        sent = true;
+      } catch {}
+    }
+    if (!sent) {
       await ctx.reply(
-        `${caption}\n\nQR: ${qris.image}`,
+        `${caption}\n\n⚠️ Foto QR gagal dimuat. Batalkan pesanan ini lalu tekan Beli lagi untuk QR baru.`,
         buttons
       );
     }
