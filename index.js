@@ -811,7 +811,7 @@ async function buildStart(name, chatId) {
         [Markup.button.callback(`🛒 Beli 1 VPS • ${formatRupiah(PRICE)} (QRIS)`, 'buy')],
         [Markup.button.callback('💰 Beli pakai Saldo', 'buy_balance'), Markup.button.callback('➕ Top Up', 'topup')],
       ];
-  rows.push([Markup.button.callback('🖥 Lihat Spek (Gambar)', 'lihat_spek')]);
+  rows.push([Markup.button.callback('🆘 Mengalami masalah? Contact Admin', 'contact_help')]);
   rows.push([Markup.button.url('⭐ Testimoni', config.testiLink)]);
   return { text, buttons: Markup.inlineKeyboard(rows) };
 }
@@ -1187,6 +1187,101 @@ bot.action('cek_join', async (ctx) => {
   await ctx.reply(text, buttons);
 });
 
+// ---- Contact Admin ----
+// User: pencet tombol / ketik /contact -> kirim pesan/foto -> diteruskan ke semua admin.
+// Admin balas: /balas <id_user> <pesan>
+const pendingContact = new Set();
+
+bot.action('contact_help', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  pendingContact.add(String(ctx.from.id));
+  await ctx.reply(
+    `🆘 Contact Admin\n\n` +
+    `Ketik /contact lalu tulis pesan kamu, atau langsung kirim di sini:\n` +
+    `• Teks, foto, video, dokumen, voice — semua bisa\n\n` +
+    `Contoh: /contact VPS saya tidak konek, IP 1.2.3.4\n\n` +
+    `Admin bakal balas langsung lewat bot.`
+  );
+});
+
+bot.command('contact', async (ctx) => {
+  const text = (ctx.message?.text || '').replace(/^\/contact(@\w+)?/, '').trim();
+  const reply = ctx.message?.reply_to_message;
+  if (text || reply?.photo || reply?.video || reply?.document || reply?.animation || reply?.voice) {
+    await forwardToAdmins(ctx, text, reply);
+    return;
+  }
+  pendingContact.add(String(ctx.from.id));
+  await ctx.reply('✍️ Tulis pesan / kirim foto masalah kamu sekarang. Nanti admin balas lewat bot ini.');
+});
+
+// Pesan non-command dari user yang lagi mode contact -> teruskan ke admin
+bot.on(['text', 'photo', 'video', 'document', 'animation', 'voice'], async (ctx, next) => {
+  try {
+    const uid = String(ctx.from?.id || '');
+    if (ctx.chat?.type !== 'private' || !pendingContact.has(uid)) return next();
+    const txt = ctx.message?.text || ctx.message?.caption || '';
+    if (txt.startsWith('/')) return next(); // command lain, lewatkan
+    pendingContact.delete(uid);
+    await forwardToAdmins(ctx, txt, null);
+  } catch { try { await next(); } catch {} }
+});
+
+async function forwardToAdmins(ctx, text, replyMsg) {
+  const uid = String(ctx.from?.id || '');
+  const name = ctx.from?.first_name || 'User';
+  const uname = ctx.from?.username ? `@${ctx.from.username}` : '(no username)';
+  pendingContact.delete(uid);
+  if (!config.adminIds.length) {
+    await ctx.reply('❌ Admin belum tersedia. Coba lagi nanti.');
+    return;
+  }
+  const header = `🆘 PESAN USER\n👤 ${name} ${uname}\n🆔 ${uid}\n━━━━━━━━━━━━`;
+  let sent = 0;
+  for (const aid of config.adminIds) {
+    try {
+      if (ctx.message?.photo) {
+        const fid = ctx.message.photo[ctx.message.photo.length - 1].file_id;
+        await bot.telegram.sendPhoto(aid, fid, { caption: `${header}\n${text || ctx.message?.caption || ''}\n\nBalas: /balas ${uid} pesan kamu`.slice(0, 1000) });
+      } else if (ctx.message?.video) {
+        await bot.telegram.sendVideo(aid, ctx.message.video.file_id, { caption: `${header}\n${text || ''}\n\nBalas: /balas ${uid} pesan kamu`.slice(0, 1000) });
+      } else if (ctx.message?.document) {
+        await bot.telegram.sendDocument(aid, ctx.message.document.file_id, { caption: `${header}\n${text || ''}\n\nBalas: /balas ${uid} pesan kamu`.slice(0, 1000) });
+      } else if (ctx.message?.voice) {
+        await bot.telegram.sendVoice(aid, ctx.message.voice.file_id, { caption: `${header}\nBalas: /balas ${uid} pesan kamu`.slice(0, 1000) });
+        if (text) await bot.telegram.sendMessage(aid, `${header}\n${text}\n\nBalas: /balas ${uid} pesan kamu`);
+      } else if (replyMsg?.photo) {
+        const fid = replyMsg.photo[replyMsg.photo.length - 1].file_id;
+        await bot.telegram.sendPhoto(aid, fid, { caption: `${header}\n${text || replyMsg.caption || ''}\n\nBalas: /balas ${uid} pesan kamu`.slice(0, 1000) });
+      } else {
+        await bot.telegram.sendMessage(aid, `${header}\n${text || '(pesan kosong)'}\n\nBalas: /balas ${uid} pesan kamu`);
+      }
+      sent++;
+    } catch (e) { console.error(`Gagal forward ke admin ${aid}:`, e.message); }
+  }
+  if (sent) await ctx.reply('✅ Pesan terkirim ke admin. Tunggu balasan di sini ya!');
+  else await ctx.reply('❌ Gagal kirim ke admin. Coba lagi nanti.');
+}
+
+// /balas <id_user> <pesan> — admin balas user
+bot.command('balas', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const args = (ctx.message?.text || '').replace(/^\/balas(@\w+)?/, '').trim().split(/\s+/).filter(Boolean);
+  if (args.length < 2) {
+    await ctx.reply('Format: /balas <id_user> <pesan>\nContoh: /balas 123456 VPS kamu sudah direset, coba lagi');
+    return;
+  }
+  const target = args[0].replace(/[^0-9]/g, '');
+  const msg = (ctx.message.text.split(/\s+/).slice(2).join(' ')).trim();
+  if (!target || !msg) { await ctx.reply('ID / pesan tidak valid.'); return; }
+  try {
+    await bot.telegram.sendMessage(target, `💬 Balasan Admin:\n\n${msg}`);
+    await ctx.reply('✅ Balasan terkirim.');
+  } catch (e) {
+    await ctx.reply(`❌ Gagal kirim: ${e.message}`);
+  }
+});
+
 // ---- Perintah admin ----
 // /admin — panel + daftar semua command admin
 bot.command('admin', async (ctx) => {
@@ -1207,12 +1302,15 @@ bot.command('admin', async (ctx) => {
     `/stok — cek stok\n` +
     `/tambahstok — tambah stok\n` +
     `/tambahsaldo <id> <nominal> — tambah saldo user\n` +
-    `/riwayat [n] — order terakhir\n\n` +
+    `/riwayat [n] — order terakhir\n` +
+    `/balas <id> <pesan> — balas pesan user (contact)\n` +
+    `/spek — kartu spek VPS\n\n` +
     `Pilih aksi cepat:`,
     Markup.inlineKeyboard([
-      [Markup.button.callback('📢 Cara Broadcast', 'bc_help')],
-      [Markup.button.callback('📋 Daftar GB', 'adm_bclist')],
+      [Markup.button.callback('📢 Cara Broadcast', 'bc_help'), Markup.button.callback('📋 Daftar GB', 'adm_bclist')],
       [Markup.button.callback('📊 Cek Stok', 'adm_stok'), Markup.button.callback('🧾 Riwayat', 'adm_riwayat')],
+      [Markup.button.callback('➕ Cara Tambah Stok', 'adm_addstok'), Markup.button.callback('💰 Cara Tambah Saldo', 'adm_addsaldo')],
+      [Markup.button.callback('⛔ Cara Block GB', 'adm_blockhelp'), Markup.button.callback('💬 Cara Balas User', 'adm_balashelp')],
     ])
   );
 });
@@ -1232,6 +1330,26 @@ bot.action('adm_stok', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const remaining = await getStockCount();
   await ctx.reply(`📊 Stok VPS: ${remaining} unit.`);
+});
+
+bot.action('adm_addstok', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  await ctx.reply(`📦 Tambah Stok\nFormat:\n/tambahstok\nip|port|user|pass\nip|port|user|pass\n\nContoh:\n/tambahstok\n1.2.3.4|2222|root|rahasia`);
+});
+
+bot.action('adm_addsaldo', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  await ctx.reply(`💰 Tambah Saldo User\nFormat:\n/tambahsaldo <id_telegram> <nominal>\n\nContoh:\n/tambahsaldo 123456 10000`);
+});
+
+bot.action('adm_blockhelp', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  await ctx.reply(`⛔ Block GB\n/bclist — lihat nomor\n/bcblock 2 — block nomor 2 (bisa banyak: /bcblock 1 3)\n/bcunblock 2 — buka block`);
+});
+
+bot.action('adm_balashelp', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  await ctx.reply(`💬 Balas Pesan User\nPesan user masuk ke DM ini lengkap dengan ID.\nBalas pakai:\n/balas <id_user> <pesan>\n\nContoh:\n/balas 123456 VPS kamu sudah direset, coba lagi`);
 });
 
 bot.action('adm_riwayat', async (ctx) => {
