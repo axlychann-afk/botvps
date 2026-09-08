@@ -249,7 +249,7 @@ function joinGateButtons() {
 async function sendToPromo(ctx, text, extra = {}) {
   const { list } = await getPromoTargets();
   if (!list.length) {
-    await ctx.reply('❌ Bot belum masuk grup promosi manapun.\nAdd bot ke GB promosi (nama bebas, acak juga oke), lalu /broadcast lagi.\nYang perlu /settesti cuma GB TESTIMONI.');
+    await ctx.reply('❌ Bot belum masuk grup promosi manapun.\nAdd bot ke GB promosi, lalu /broadcast lagi.');
     return false;
   }
   let ok = 0;
@@ -282,7 +282,7 @@ async function getPromoId() {
 async function getPromoTargets() {
   try {
     const g = await readJson(groupsFile);
-    const testi = config.testiGroupId || g?.testiGroupId || '';
+    const testi = String(config.testiGroupId || '');
     let list = [];
     if (Array.isArray(g?.promoGroups)) list = [...g.promoGroups];
     if (g?.promoGroupId) list.push(String(g.promoGroupId));
@@ -292,11 +292,7 @@ async function getPromoTargets() {
   } catch { return { list: config.promoGroupId ? [String(config.promoGroupId)] : [], testi: '' }; }
 }
 async function getTestiId() {
-  if (config.testiGroupId) return config.testiGroupId;
-  try {
-    const g = await readJson(groupsFile);
-    return g?.testiGroupId || '';
-  } catch { return ''; }
+  return config.testiGroupId || '';
 }
 async function saveGroupId(key, value) {
   let g = {};
@@ -1170,45 +1166,6 @@ bot.action('cek_join', async (ctx) => {
 });
 
 // ---- Perintah admin ----
-// /settesti — SATU-SATUNYA command wajib, ketik DI DALAM GB Testimoni.
-// /setpromo — opsional, buat daftarin grup manual kalau event auto ke-skip.
-bot.command('setpromo', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  if (ctx.chat?.type === 'private') {
-    const { list } = await getPromoTargets();
-    await ctx.reply(`📢 Target promosi saat ini (${list.length}):\n${list.join('\n') || '(kosong — add bot ke grup, otomatis masuk)'}\n\nKalau ada grup ke-skip, masuk ke grup itu lalu ketik /setpromo di sana.`);
-    return;
-  }
-  let g = {};
-  try { g = await readJson(groupsFile); } catch {}
-  if (!Array.isArray(g.promoGroups)) g.promoGroups = [];
-  const id = String(ctx.chat.id);
-  if (!g.promoGroups.map(String).includes(id)) g.promoGroups.push(id);
-  // kalau grup ini sempat ketandai testimoni, cabut
-  if (String(g.testiGroupId) === id) delete g.testiGroupId;
-  await saveGroupId('promoGroups', g.promoGroups);
-  await writeJson(groupsFile, g);
-  await ctx.reply(`✅ GB ini terdaftar sebagai TARGET PROMOSI.\nID: ${ctx.chat.id}`);
-});
-bot.command('settesti', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  if (ctx.chat?.type === 'private') {
-    await ctx.reply('Ketik /settesti DI DALAM GB Testimoni (bukan di sini). Cuma grup ini yang perlu ditandai — sisanya otomatis promosi.');
-    return;
-  }
-  const id = String(ctx.chat.id);
-  await saveGroupId('testiGroupId', id);
-  // cabut dari daftar promosi biar broadcast gak nyasar ke sini
-  try {
-    let g = await readJson(groupsFile);
-    if (Array.isArray(g.promoGroups)) {
-      g.promoGroups = g.promoGroups.filter((x) => String(x) !== id);
-      if (g.promoGroupId && String(g.promoGroupId) === id) delete g.promoGroupId;
-      await writeJson(groupsFile, g);
-    }
-  } catch {}
-  await ctx.reply(`✅ GB ini terdaftar sebagai GB TESTIMONI.\nID: ${ctx.chat.id}\nTestimoni otomatis + gate join pakai grup ini. Grup lain (nama bebas/acak) otomatis jadi target broadcast.`);
-});
 // /admin — panel khusus admin
 bot.command('admin', async (ctx) => {
   if (!isAdmin(ctx)) return;
@@ -1216,8 +1173,8 @@ bot.command('admin', async (ctx) => {
   const tg = await getTestiId();
   await ctx.reply(
     `🛠 Panel Admin — ${config.shopName}\n` +
-    `GB Promosi: ${list.length} grup (otomatis, nama bebas)\n` +
-    `GB Testimoni: ${tg || '(belum diset — ketik /settesti di grup testimoni)'}\n\n` +
+    `GB Promosi: ${list.length} grup (otomatis)\n` +
+    `GB Testimoni: ${tg || '(belum diset di .env)'}\n\n` +
     `Pilih aksi:`,
     Markup.inlineKeyboard([
       [Markup.button.callback('📢 Broadcast Teks ke GB Promosi', 'bc_help')],
@@ -1233,8 +1190,7 @@ bot.action('bc_help', async (ctx) => {
     `📢 BROADCAST PROMOSI (khusus admin)\n\n` +
     `Cara 1 — teks langsung:\n/broadcast teks promosi disini...\n\n` +
     `Cara 2 — forward media:\nReply foto/video/dokumen dengan /broadcast, caption ikut terkirim.\n\n` +
-    `Target: ${list.length} GB promosi (otomatis semua grup kecuali testimoni).\n` +
-    `Cuma GB Testimoni yang perlu /settesti 1x.`
+    `Target: ${list.length} GB promosi (otomatis semua grup kecuali testimoni).`
   );
 });
 
@@ -1258,7 +1214,7 @@ bot.command('broadcast', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const { list } = await getPromoTargets();
   if (!list.length) {
-    await ctx.reply('❌ Bot belum masuk grup promosi manapun.\nAdd bot ke GB (nama bebas/acak), otomatis jadi target.\nCuma GB Testimoni yang perlu /settesti 1x.');
+    await ctx.reply('❌ Bot belum masuk grup promosi manapun.\nAdd bot ke GB, lalu ulangi /broadcast.');
     return;
   }
   const msg = ctx.message || {};
@@ -1356,9 +1312,8 @@ bot.command('riwayat', async (ctx) => {
   await ctx.reply(`🧾 ${list.length} order terakhir:\n\n${lines.join('\n\n').slice(0, 3500)}`);
 });
 
-// Bot baru masuk grup (di-add / di-approve) -> otomatis jadi TARGET PROMOSI.
-// Nama grup BEBAS / acak, gak perlu kata kunci. Satu-satunya yang perlu
-// ditandai manual: GB TESTIMONI via /settesti di grup itu.
+// Bot baru masuk grup (di-add / di-approve) -> diam-diam jadi TARGET PROMOSI.
+// Tanpa sapaan, tanpa command. Testimoni murni dari TESTI_GROUP_ID di .env.
 bot.on('my_chat_member', async (ctx) => {
   try {
     const upd = ctx.myChatMember;
@@ -1369,20 +1324,17 @@ bot.on('my_chat_member', async (ctx) => {
     let g = {};
     try { g = await readJson(groupsFile); } catch {}
     if (!Array.isArray(g.promoGroups)) g.promoGroups = [];
-    // Bot dikick / dibanned -> cabut dari daftar
     if (['left', 'kicked', 'banned'].includes(st)) {
       g.promoGroups = g.promoGroups.filter((x) => String(x) !== id);
       await writeJson(groupsFile, g).catch(() => {});
       return;
     }
     if (!['member', 'administrator'].includes(st)) return;
-    const testi = String(config.testiGroupId || g.testiGroupId || '');
+    const testi = String(config.testiGroupId || '');
     if (id === testi) return; // grup testimoni bukan target promosi
     if (!g.promoGroups.map(String).includes(id)) {
       g.promoGroups.push(id);
-      await writeJson(groupsFile, g);
-      await ctx.reply(`✅ Halo! Grup ini otomatis jadi TARGET PROMOSI.\n/broadcast dari chat admin bakal terkirim ke sini.\n⚠️ Jangan jadikan grup testimoni — kalau ini grup testimoni, admin ketik /settesti.`).catch(() => {});
-      await notifyAdmins(`✅ Auto-promosi: "${chat.title}" (${id}) ditambah. Total target: ${g.promoGroups.length}.`);
+      await writeJson(groupsFile, g).catch(() => {});
     }
   } catch {}
 });
