@@ -711,12 +711,70 @@ async function buildStart(name, chatId) {
   return { text, buttons: Markup.inlineKeyboard(rows) };
 }
 
+// Foto kartu spek saja (buffer) — dipakai /start gabungan. null kalau sharp gagal.
+async function specPhoto() {
+  const sharp = await getSharp();
+  if (!sharp) return null;
+  try {
+    let stock = 0, os = null, pingVps = null;
+    try {
+      const s = await readJson(stockFile);
+      stock = Array.isArray(s) ? s.length : 0;
+      const first = Array.isArray(s) ? s.find((v) => v && v.ip) : null;
+      if (first) {
+        os = first.os || null;
+        const p0 = Date.now();
+        const sock = (await import('node:net')).default;
+        await new Promise((resolve) => {
+          const c = sock.connect(Number(first.port) || 22, first.ip);
+          c.setTimeout(3000);
+          c.on('connect', () => { pingVps = Date.now() - p0; c.destroy(); resolve(); });
+          c.on('timeout', () => { c.destroy(); resolve(); });
+          c.on('error', () => resolve());
+        });
+      }
+    } catch {}
+    const rows = {
+      os: os || 'Ubuntu 22.04.5 LTS x86_64',
+      host: 'Google Compute Engine',
+      kernel: '6.18.15 cloud-amd64',
+      cpu: 'Xeon Platinum 8581C (32) @ 2.1GHz',
+      ram: '258GB DDR5',
+      uptime: '47+ hari nonstop',
+    };
+    return await sharp(Buffer.from(specSvg({ rows, pingVps, pingBot: null, stock }))).png().toBuffer();
+  } catch (e) { console.error('Gagal bikin kartu spek:', e.message); return null; }
+}
+
+// Teks menu versi caption foto (1024 char max) — spek detail ada di gambar, di sini ringkas.
+function menuCaption(name, balance, remaining, total, percent, dot, empty) {
+  return (
+    `✦ ${config.shopName} ✦ — Halo, ${name}! 👋\n` +
+    `💰 Saldo : ${formatRupiah(balance)} | 📦 1 VPS = ${formatRupiah(UNIT_PRICE)}\n` +
+    `📊 Stok : ${dot} ${remaining}/${total} (${percent}%) ${stockBar(percent)}\n` +
+    (empty ? `❌ Stok habis — coba lagi nanti.\n` : ``) +
+    `⚡ Auto-order setelah bayar 🔒 Testimoni di channel`
+  ).slice(0, 1000);
+}
+
 bot.start(async (ctx) => {
   const name = ctx.from?.first_name || 'kak';
   const chatId = getChatId(ctx);
-  // Kartu spek di atas, menu teks di bawah — 1 alur /start.
-  await sendSpecCard(ctx, true);
   const { text, buttons } = await buildStart(name, chatId);
+  // Gabung: 1 pesan foto (kartu spek) + caption menu + tombol. Fallback teks bila render gagal.
+  const photo = await specPhoto();
+  if (photo) {
+    const remaining = await getStockCount();
+    const balance = chatId ? await getBalance(chatId) : 0;
+    const total = config.stockTotal > 0 ? config.stockTotal : Math.max(remaining, 1);
+    const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
+    const dot = remaining < 1 ? '🔴' : percent < 30 ? '🟡' : '🟢';
+    await ctx.replyWithPhoto({ source: photo }, {
+      caption: menuCaption(name, balance, remaining, total, percent, dot, remaining < 1),
+      ...buttons,
+    }).catch(async () => { await ctx.reply(text, buttons); });
+    return;
+  }
   await ctx.reply(text, buttons);
 });
 
