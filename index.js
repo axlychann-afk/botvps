@@ -41,6 +41,9 @@ const config = {
   // Total kapasitas stok untuk bar persen. Isi mis. 102. Kalau 0/kosong, total = sisa saat ini.
   stockTotal: Number(process.env.STOCK_TOTAL || 0),
   productSpec: process.env.PRODUCT_SPEC || 'NAT | Unlimited',
+  // Spek host (dari neofetch VPS 2026-09-08). Catatan: NAT container lihat spek host;
+  // alokasi riil per unit ikut PRODUCT_SPEC. Update VPS_SPECS bila host ganti.
+  vpsSpecs: String(process.env.VPS_SPECS || 'Xeon Platinum 8581C (32 Core),RAM 258GB DDR5,NVMe SSD,Google Cloud Network').split(',').map((s) => s.trim()).filter(Boolean),
   adminIds: String(process.env.ADMIN_IDS || '').split(',').map((s) => s.trim()).filter(Boolean),
   testiGroupId: process.env.TESTI_GROUP_ID || '',
   shopName: process.env.SHOP_NAME || 'VPS NAT Store',
@@ -270,7 +273,86 @@ function testiSvg({ title, name, detail, amount, date, ref }) {
 </svg>`;
 }
 
-// kind: 'buy' | 'topup'
+// Kartu gambar spek VPS (gaya neofetch) — /spek kirim foto ini.
+function specSvg({ rows, pingVps, pingBot, stock }) {
+  const shop = escXml(config.shopName);
+  const line = (y, k, v, color = '#ffffff') =>
+    `<text x="110" y="${y}" font-family="Arial,sans-serif" font-size="23" fill="#94a3b8">${escXml(k)}</text>` +
+    `<text x="300" y="${y}" font-family="Arial,sans-serif" font-size="23" font-weight="bold" fill="${color}">: ${escXml(v)}</text>`;
+  return `<svg width="800" height="600" viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+<stop offset="0" stop-color="#0b1220"/><stop offset="1" stop-color="#1b2a4a"/>
+</linearGradient>
+<linearGradient id="acc" x1="0" y1="0" x2="1" y2="0">
+<stop offset="0" stop-color="#22c55e"/><stop offset="1" stop-color="#22d3ee"/>
+</linearGradient>
+</defs>
+<rect x="8" y="8" width="784" height="584" rx="24" fill="url(#bg)" stroke="#22c55e" stroke-width="3"/>
+<rect x="8" y="8" width="784" height="10" rx="5" fill="url(#acc)"/>
+<text x="400" y="80" text-anchor="middle" font-family="Arial,sans-serif" font-size="38" font-weight="bold" fill="#ffffff" letter-spacing="2">💻 SPESIFIKASI VPS</text>
+<rect x="110" y="102" width="580" height="4" rx="2" fill="url(#acc)"/>
+${line(155, 'OS', rows.os || 'Ubuntu 22.04.5 LTS x86_64')}
+${line(200, 'Host', rows.host || 'Google Compute Engine')}
+${line(245, 'Kernel', rows.kernel || '6.18.15 cloud-amd64')}
+${line(290, 'CPU', rows.cpu || 'Xeon Platinum 8581C (32) @ 2.1GHz', '#22d3ee')}
+${line(335, 'RAM', rows.ram || '258GB DDR5', '#22c55e')}
+${line(380, 'Uptime', rows.uptime || '47+ hari nonstop')}
+${line(425, 'Harga', formatRupiah(UNIT_PRICE) + ' / unit', '#fbbf24')}
+${line(470, 'Ping VPS', pingVps === null ? '—' : pingVps + ' ms', '#22c55e')}
+${line(515, 'Stok', stock + ' unit ready')}
+<rect x="110" y="535" width="580" height="4" rx="2" fill="url(#acc)"/>
+<text x="400" y="572" text-anchor="middle" font-family="Arial,sans-serif" font-size="22" font-weight="bold" fill="#ffffff">${shop}</text>
+</svg>`;
+}
+
+async function sendSpecCard(ctx, quiet = false) {
+  let stock = 0, os = null, pingVps = null;
+  try {
+    const s = await readJson(stockFile);
+    stock = Array.isArray(s) ? s.length : 0;
+    const first = Array.isArray(s) ? s.find((v) => v && v.ip) : null;
+    if (first) {
+      os = first.os || null;
+      const p0 = Date.now();
+      const sock = (await import('node:net')).default;
+      await new Promise((resolve) => {
+        const c = sock.connect(Number(first.port) || 22, first.ip);
+        c.setTimeout(3000);
+        c.on('connect', () => { pingVps = Date.now() - p0; c.destroy(); resolve(); });
+        c.on('timeout', () => { c.destroy(); resolve(); });
+        c.on('error', () => resolve());
+      });
+    }
+  } catch {}
+  const sharp = await getSharp();
+  const caption = quiet
+    ? `💻 Spesifikasi VPS ${config.shopName} — detail & order di bawah 👇`
+    : `💻 Spesifikasi VPS ${config.shopName}\n💰 ${formatRupiah(UNIT_PRICE)}/unit — pencet /start buat order.`;
+  if (sharp) {
+    try {
+      const rows = {
+        os: os || 'Ubuntu 22.04.5 LTS x86_64',
+        host: 'Google Compute Engine',
+        kernel: '6.18.15 cloud-amd64',
+        cpu: 'Xeon Platinum 8581C (32) @ 2.1GHz',
+        ram: '258GB DDR5',
+        uptime: '47+ hari nonstop',
+      };
+      const buf = await sharp(Buffer.from(specSvg({ rows, pingVps, pingBot: null, stock }))).png().toBuffer();
+      await ctx.replyWithPhoto({ source: buf }, { caption });
+      return;
+    } catch (e) { console.error('Gagal bikin kartu spek:', e.message); }
+  }
+  await ctx.reply(caption + `\nOS: Ubuntu 22.04.5 LTS\nCPU: Xeon Platinum 8581C (32)\nRAM: 258GB\nStok: ${stock} unit`);
+}
+
+bot.command('spek', async (ctx) => { await sendSpecCard(ctx); });
+
+bot.action('lihat_spek', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  await sendSpecCard(ctx);
+});
 async function sendTesti(kind, { name, detail, amount, ref }) {
   if (!config.testiGroupId) return;
   const title = kind === 'topup' ? 'TESTIMONI DEPOSIT' : 'TESTIMONI PEMBELIAN';
@@ -564,12 +646,42 @@ function stockBar(percent) {
 // Tampilan /start gaya auto-order dengan stok & saldo live.
 // Kalau stok < 2, tombol beli diganti tombol refresh (order diblokir di action 'buy' juga).
 async function buildStart(name, chatId) {
+  const t0 = Date.now();
   const remaining = await getStockCount();
   const balance = chatId ? await getBalance(chatId) : 0;
+  let ping = null;
+  try {
+    await bot.telegram.getMe();
+    ping = Date.now() - t0;
+  } catch { ping = null; }
+  // Spek live dari data stok: OS unit pertama + ping TCP ke IP stok pertama.
+  let stockOs = null, stockPing = null;
+  try {
+    const stock = await readJson(stockFile);
+    const first = Array.isArray(stock) ? stock.find((v) => v && v.ip) : null;
+    if (first) {
+      stockOs = first.os || null;
+      const p0 = Date.now();
+      const sock = (await import('node:net')).default;
+      await new Promise((resolve) => {
+        const s = sock.connect(Number(first.port) || 22, first.ip);
+        s.setTimeout(3000);
+        s.on('connect', () => { stockPing = Date.now() - p0; s.destroy(); resolve(); });
+        s.on('timeout', () => { s.destroy(); resolve(); });
+        s.on('error', () => resolve());
+      });
+    }
+  } catch {}
   const total = config.stockTotal > 0 ? config.stockTotal : Math.max(remaining, 1);
   const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
   const empty = remaining < 1;
   const dot = empty ? '🔴' : percent < 30 ? '🟡' : '🟢';
+  const specLines = config.vpsSpecs.map((s) => `│  • ${s}`).join('\n');
+  const liveLines = [
+    stockOs ? `│  • OS : ${stockOs}` : null,
+    stockPing === null ? null : `│  • Ping VPS : ${stockPing} ms ${stockPing < 300 ? '🟢' : stockPing < 800 ? '🟡' : '🔴'}`,
+    ping === null ? '│  • Ping Bot : —' : `│  • Ping Bot : ${ping} ms`,
+  ].filter(Boolean).join('\n');
   const text =
     `✦ ${config.shopName} ✦\n` +
     `VPS NAT Premium — Cepat, Stabil, Terpercaya\n` +
@@ -578,7 +690,9 @@ async function buildStart(name, chatId) {
     `Selamat datang di layanan auto-order kami.\n\n` +
     `💰 Saldo Anda : ${formatRupiah(balance)}\n\n` +
     `📦 Produk : VPS NAT\n` +
-    `└ Harga : ${formatRupiah(UNIT_PRICE)} / unit\n` +
+    `│  • Harga : ${formatRupiah(UNIT_PRICE)} / unit\n` +
+    `${specLines ? specLines + '\n' : ''}` +
+    `${liveLines ? liveLines + '\n' : ''}` +
     `└ Spesifikasi : ${config.productSpec}\n\n` +
     `📊 Stok : ${dot} ${remaining}/${total} unit (${percent}%)\n` +
     `${stockBar(percent)}\n` +
@@ -592,6 +706,7 @@ async function buildStart(name, chatId) {
         [Markup.button.callback(`🛒 Beli 1 VPS • ${formatRupiah(PRICE)} (QRIS)`, 'buy')],
         [Markup.button.callback('💰 Beli pakai Saldo', 'buy_balance'), Markup.button.callback('➕ Top Up', 'topup')],
       ];
+  rows.push([Markup.button.callback('🖥 Lihat Spek (Gambar)', 'lihat_spek')]);
   rows.push([Markup.button.url('⭐ Testimoni', 'https://t.me/testimonialnat')]);
   return { text, buttons: Markup.inlineKeyboard(rows) };
 }
@@ -599,6 +714,8 @@ async function buildStart(name, chatId) {
 bot.start(async (ctx) => {
   const name = ctx.from?.first_name || 'kak';
   const chatId = getChatId(ctx);
+  // Kartu spek di atas, menu teks di bawah — 1 alur /start.
+  await sendSpecCard(ctx, true);
   const { text, buttons } = await buildStart(name, chatId);
   await ctx.reply(text, buttons);
 });
