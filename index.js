@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import {
   balance as otpBalance,
   cachedServices,
-  indoRow,
+  cachedCountries,
   cheapestProvider,
   operatorsV2,
   createOrderV2,
@@ -1165,6 +1165,16 @@ async function countActiveNokos(chatId) {
   } catch { return 0; }
 }
 
+// Cek saldo owner di provider cukup buat modal? Fail-fast sebelum user bayar.
+async function providerReady(modal) {
+  try {
+    const b = await otpBalance();
+    return { ok: Number(b?.balance || 0) >= Number(modal || 0), balance: Number(b?.balance || 0) };
+  } catch (e) {
+    return { ok: false, balance: 0, error: e.message };
+  }
+}
+
 function nokosButtons(orderId) {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🔁 Minta kirim ulang kode', `nkr:${orderId}`)],
@@ -1232,8 +1242,22 @@ async function activateNokos(orderId) {
     order.status = 'failed';
     order.failReason = e.message;
     await writeJson(ordersFile, orders);
-    await bot.telegram.sendMessage(order.chatId, `❌ Gagal order nomor ke provider: ${e.message}\nHubungi admin, simpan ref: ${order.reference || order.id}`).catch(() => {});
-    await notifyAdmins(`🚨 NOKOS GAGAL\n👤 ${order.buyerName} (${order.chatId})\n💰 ${formatRupiah(order.total)} lunas tapi order provider gagal: ${e.message}\nRef: ${order.reference || order.id}`);
+    // User SUDAH bayar (QRIS lunas / saldo kepotong) tapi provider gagal:
+    // refund otomatis ke saldo bot biar user ga rugi, admin tinggal beresin.
+    if (order.payMethod === 'qris') {
+      try {
+        const users = await readJson(usersFile);
+        const u = users[order.chatId] || { balance: 0 };
+        u.balance = (Number(u.balance) || 0) + Number(order.total || 0);
+        if (order.buyerName) u.name = order.buyerName;
+        users[order.chatId] = u;
+        await writeJson(usersFile, users);
+        order.refunded = Number(order.total || 0);
+        await writeJson(ordersFile, orders);
+      } catch {}
+    }
+    await bot.telegram.sendMessage(order.chatId, `❌ Gagal order nomor ke provider: ${e.message}\n${order.payMethod === 'qris' ? `💰 ${formatRupiah(order.total)} OTOMATIS balik jadi saldo bot kamu. Cek /saldo.` : `💰 Saldo kamu TIDAK kepotong, aman.`}\nSimpan ref: ${order.reference || order.id}`).catch(() => {});
+    await notifyAdmins(`🚨 NOKOS GAGAL\n👤 ${order.buyerName} (${order.chatId})\n📦 ${order.serviceLabel || ''} ${order.countryLabel || ''}\n💰 ${formatRupiah(order.total)} (${order.payMethod}) — provider gagal: ${e.message}\n${order.payMethod === 'qris' ? '✅ Auto-refund ke saldo bot user.' : 'Saldo user aman (belum dipotong).'}\nRef: ${order.reference || order.id}`);
     return false;
   }
   order.kind = 'nokos';
@@ -1246,7 +1270,7 @@ async function activateNokos(orderId) {
   startNokosPoll(order.id);
   await bot.telegram.sendMessage(
     order.chatId,
-    `📱 Nokos aktif!\n━━━━━━━━━━━━\n📦 ${order.serviceLabel} — Indonesia\n📞 Nomor: \`${order.phone}\`\n🆔 Order: ${order.roOrderId}\n⏰ Aktif ${config.nokosTimeoutMinutes} menit, OTP otomatis diteruskan ke sini.\n\nMasukkan nomor ini di aplikasi, tunggu kodenya.`,
+    `📱 Nokos aktif!\n━━━━━━━━━━━━\n📦 ${order.serviceLabel} — ${order.countryLabel || 'Indonesia'}\n📞 Nomor: \`${order.phone}\`\n🆔 Order: ${order.roOrderId}\n⏰ Aktif ${config.nokosTimeoutMinutes} menit, OTP otomatis diteruskan ke sini.\n\nMasukkan nomor ini di aplikasi, tunggu kodenya.`,
     { parse_mode: 'Markdown', ...nokosButtons(order.id) }
   ).catch(() => {});
   try {
@@ -1255,14 +1279,42 @@ async function activateNokos(orderId) {
   return true;
 }
 
+const NOKOS_PAGE = 8; // tombol per halaman browser
+
+async function nokosActiveList(chatId) {
+  try {
+    const orders = await readJson(ordersFile);
+    return Object.values(orders).filter((o) => o && o.chatId === chatId && o.kind === 'nokos' && o.status === 'active');
+  } catch { return []; }
+}
+
+async function serviceLabel(serviceId) {
+  const fav = NOKOS_CATALOG.find((s) => s.serviceId === Number(serviceId));
+  if (fav) return `${fav.emoji} ${fav.label}`;
+  try {
+    const all = await cachedServices();
+    const hit = (all || []).find((s) => String(s.service_code) === String(serviceId));
+    if (hit) return hit.service_name;
+  } catch {}
+  return `Service ${serviceId}`;
+}
+
+function countryCheapest(row) {
+  const list = (row?.pricelist || []).filter((p) => p.available !== false && Number(p.stock) > 0);
+  if (!list.length) return null;
+  return list.reduce((a, b) => (Number(a.price) <= Number(b.price) ? a : b));
+}
+
+function nokosFavRows() {
+  return NOKOS_CATALOG.map((s) => [Markup.button.callback(`${s.emoji} ${s.label} — Indo (cepat)`, `nk:${s.serviceId}`)]);
+}
+
 bot.command('nokos', async (ctx) => {
   if (!nokosOn()) { await ctx.reply('❌ Fitur nokos belum aktif (RUMAHOTP_KEY kosong).'); return; }
-  const orders = await readJson(ordersFile).catch(() => ({}));
-  const mine = Object.values(orders).filter((o) => o && o.chatId === getChatId(ctx) && o.kind === 'nokos' && o.status === 'active');
-  const rows = NOKOS_CATALOG.map((s) => [Markup.button.callback(`${s.emoji} ${s.label} — Indo`, `nk:${s.serviceId}`)]);
+  const mine = await nokosActiveList(getChatId(ctx));
   await ctx.reply(
-    `📱 Nokos OTP — Indo\nHarga = modal provider + ${formatRupiah(config.nokosMarkup)} (untung lu)\nAktif kamu: ${mine.length}/${config.nokosMaxActive}\n${mine.map((o) => `• ${o.serviceLabel} ${o.phone} (${o.roOrderId})`).join('\n')}\n\nPilih layanan:`,
-    Markup.inlineKeyboard(rows)
+    `📱 Nokos OTP — semua layanan + semua negara\nHarga = modal provider + ${formatRupiah(config.nokosMarkup)} (untung lu)\nAktif kamu: ${mine.length}/${config.nokosMaxActive}\n${mine.map((o) => `• ${o.serviceLabel} ${o.phone} (${o.roOrderId})`).join('\n')}\n\nJalur cepat atau browser lengkap:`,
+    Markup.inlineKeyboard([...nokosFavRows(), [Markup.button.callback('🔍 Semua layanan', 'nks:0')]])
   );
 });
 
@@ -1273,68 +1325,172 @@ bot.action('nokos', async (ctx) => {
     await ctx.reply(`⚠️ Wajib gabung GB Testimoni dulu:\n👉 ${config.testiLink}`, joinGateButtons()).catch(() => {});
     return;
   }
-  const rows = NOKOS_CATALOG.map((s) => [Markup.button.callback(`${s.emoji} ${s.label} — Indo`, `nk:${s.serviceId}`)]);
-  await ctx.reply(`📱 Pilih layanan nokos (Indo):`, Markup.inlineKeyboard(rows));
+  const mine = await nokosActiveList(getChatId(ctx));
+  await ctx.reply(
+    `📱 Nokos OTP (aktif: ${mine.length}/${config.nokosMaxActive})\nPilih jalur cepat atau browser lengkap:`,
+    Markup.inlineKeyboard([...nokosFavRows(), [Markup.button.callback('🔍 Semua layanan', 'nks:0')]])
+  );
+});
+
+// ---- Browser services (paging, ratusan service) ----
+bot.action(/^nks:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const page = Math.max(0, Number(ctx.match[1]) || 0);
+  let all = [];
+  try { all = await cachedServices(); }
+  catch (e) { await ctx.reply(`Gagal ambil layanan: ${e.message}`); return; }
+  const total = Math.max(1, Math.ceil(all.length / NOKOS_PAGE));
+  const p = Math.min(page, total - 1);
+  const slice = all.slice(p * NOKOS_PAGE, p * NOKOS_PAGE + NOKOS_PAGE);
+  const rows = slice.map((s) => [Markup.button.callback(`📦 ${s.service_name}`, `nsvc:${s.service_code}:0`)]);
+  const nav = [];
+  if (p > 0) nav.push(Markup.button.callback('◀️', `nks:${p - 1}`));
+  nav.push(Markup.button.callback(`${p + 1}/${total}`, 'nokos_noop'));
+  if (p < total - 1) nav.push(Markup.button.callback('▶️', `nks:${p + 1}`));
+  rows.push(nav);
+  await ctx.reply(`🔍 Semua layanan (${all.length}) — hal ${p + 1}/${total}:`, Markup.inlineKeyboard(rows));
+});
+
+bot.action('nokos_noop', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); });
+
+// ---- Browser negara per service (Indo paling atas, sisanya termurah dulu) ----
+bot.action(/^nsvc:(\d+):(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const serviceId = Number(ctx.match[1]);
+  const page = Math.max(0, Number(ctx.match[2]) || 0);
+  let rows = [];
+  try { rows = await cachedCountries(serviceId); }
+  catch (e) { await ctx.reply(`Gagal ambil negara: ${e.message}`); return; }
+  const label = await serviceLabel(serviceId);
+  const withPrice = (rows || []).map((r) => ({ r, cheap: countryCheapest(r) })).filter((x) => x.cheap);
+  withPrice.sort((a, b) => {
+    const ai = /indonesia/i.test(a.r.name || '') ? 0 : 1;
+    const bi = /indonesia/i.test(b.r.name || '') ? 0 : 1;
+    return ai - bi || Number(a.cheap.price) - Number(b.cheap.price);
+  });
+  if (!withPrice.length) { await ctx.reply(`❌ ${label}: semua negara lagi kosong.`); return; }
+  const total = Math.max(1, Math.ceil(withPrice.length / NOKOS_PAGE));
+  const p = Math.min(page, total - 1);
+  const slice = withPrice.slice(p * NOKOS_PAGE, p * NOKOS_PAGE + NOKOS_PAGE);
+  const kb = slice.map(({ r, cheap }) => [Markup.button.callback(
+    `${/indonesia/i.test(r.name || '') ? '🇮🇩' : '🌍'} ${r.name} — ${formatRupiah(sellPrice(cheap.price))} (stok ${r.stock_total})`,
+    `nky:${serviceId}:${r.number_id}`
+  )]);
+  const nav = [];
+  if (p > 0) nav.push(Markup.button.callback('◀️', `nsvc:${serviceId}:${p - 1}`));
+  nav.push(Markup.button.callback(`${p + 1}/${total}`, 'nokos_noop'));
+  if (p < total - 1) nav.push(Markup.button.callback('▶️', `nsvc:${serviceId}:${p + 1}`));
+  kb.push(nav);
+  await ctx.reply(`🌍 ${label} — pilih negara (hal ${p + 1}/${total}, harga jual termurah):`, Markup.inlineKeyboard(kb));
+});
+
+// ---- Pilih provider per negara (termurah dulu, top 8) ----
+bot.action(/^nky:(\d+):(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const serviceId = Number(ctx.match[1]);
+  const numberId = Number(ctx.match[2]);
+  let rows = [];
+  try { rows = await cachedCountries(serviceId); }
+  catch (e) { await ctx.reply(`Gagal ambil stok: ${e.message}`); return; }
+  const row = (rows || []).find((r) => Number(r.number_id) === numberId);
+  if (!row) { await ctx.reply('Negara tidak ketemu.'); return; }
+  const label = await serviceLabel(serviceId);
+  const list = (row.pricelist || []).filter((p) => p.available !== false && Number(p.stock) > 0);
+  list.sort((a, b) => Number(a.price) - Number(b.price));
+  if (!list.length) { await ctx.reply('❌ Provider negara ini lagi kosong.'); return; }
+  const kb = list.slice(0, NOKOS_PAGE).map((p) => [Markup.button.callback(
+    `💰 ${formatRupiah(sellPrice(p.price))} — stok ${p.stock} (server ${p.server_id})`,
+    `nkp:${serviceId}:${numberId}:${p.provider_id}`
+  )]);
+  await ctx.reply(`🏭 ${label} — ${row.name} (${row.prefix})\nPilih provider (harga jual, termurah dulu):`, Markup.inlineKeyboard(kb));
 });
 
 bot.action(/^nk:(\d+)$/, async (ctx) => {
-  await showNokosDetail(ctx, Number(ctx.match[1]), false);
+  await showNokosDetail(ctx, Number(ctx.match[1]), null, null, false);
 });
 
 bot.action(/^nkrf:(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery('Refresh harga...').catch(() => {});
-  await showNokosDetail(ctx, Number(ctx.match[1]), true);
+  await showNokosDetail(ctx, Number(ctx.match[1]), null, null, true);
 });
 
-async function showNokosDetail(ctx, serviceId, force) {
-  const cat = NOKOS_CATALOG.find((s) => s.serviceId === serviceId);
-  if (!cat) { await ctx.reply('Layanan tidak dikenal.'); return; }
-  let row = null;
-  try { row = await indoRow(serviceId, force); }
-  catch (e) { await ctx.reply(`Gagal ambil stok: ${e.message}`); return; }
-  if (!row) { await ctx.reply('❌ Indo tidak tersedia untuk layanan ini.'); return; }
-  const best = cheapestProvider(row);
-  if (!best) { await ctx.reply('❌ Stok Indo lagi kosong. Coba lagi nanti.'); return; }
-  const jual = sellPrice(best.price);
+bot.action(/^nkp:(\d+):(\d+):([^:]+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  await showNokosDetail(ctx, Number(ctx.match[1]), Number(ctx.match[2]), String(ctx.match[3]), false);
+});
+
+async function showNokosDetail(ctx, serviceId, numberId, providerId, force) {
+  let meta = null;
+  try { meta = await prepareNokosMeta(serviceId, numberId, providerId, force); }
+  catch (e) { await ctx.reply(`Gagal: ${e.message}`); return; }
+  const tag = `${meta.label} — ${meta.row.name} (${meta.row.prefix})`;
   await ctx.reply(
-    `${cat.emoji} ${cat.label} — Indonesia\n` +
-    `📞 Prefix ${row.prefix} | stok provider termurah: ${best.stock}\n` +
-    `💰 Modal ${formatRupiah(best.price)} → jual ${formatRupiah(jual)}\n` +
+    `📱 ${tag}\n` +
+    `🏭 Provider ${meta.best.provider_id} (server ${meta.best.server_id}) | stok: ${meta.best.stock}\n` +
+    `💰 Modal ${formatRupiah(meta.best.price)} → jual ${formatRupiah(meta.jual)}\n` +
     `⏰ Nomor aktif ${config.nokosTimeoutMinutes} mnt, OTP auto-forward.${force ? '\n🔄 Harga fresh dari provider.' : ''}\n\nBayar pakai:`,
     Markup.inlineKeyboard([
-      [Markup.button.callback(`🛒 QRIS ${formatRupiah(jual)}`, `nbuy:${serviceId}`)],
-      [Markup.button.callback(`💰 Saldo ${formatRupiah(jual)}`, `nbuybal:${serviceId}`)],
-      [Markup.button.callback('🔄 Refresh harga', `nkrf:${serviceId}`)],
+      [Markup.button.callback(`🛒 QRIS ${formatRupiah(meta.jual)}`, `nbuy:${serviceId}:${meta.row.number_id}:${meta.best.provider_id}`)],
+      [Markup.button.callback(`💰 Saldo ${formatRupiah(meta.jual)}`, `nbuybal:${serviceId}:${meta.row.number_id}:${meta.best.provider_id}`)],
+      [Markup.button.callback('🔄 Refresh harga', `nkrfp:${serviceId}:${meta.row.number_id}:${meta.best.provider_id}`)],
     ])
   );
 }
 
-async function prepareNokosMeta(serviceId) {
-  const cat = NOKOS_CATALOG.find((s) => s.serviceId === serviceId);
-  if (!cat) throw new Error('Layanan tidak dikenal.');
-  const row = await indoRow(serviceId, true); // harga fresh pas bayar, bukan cache
-  if (!row) throw new Error('Indo tidak tersedia.');
-  const best = cheapestProvider(row);
-  if (!best) throw new Error('Stok Indo kosong.');
+bot.action(/^nkrfp:(\d+):(\d+):([^:]+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Refresh harga...').catch(() => {});
+  await showNokosDetail(ctx, Number(ctx.match[1]), Number(ctx.match[2]), String(ctx.match[3]), true);
+});
+
+async function prepareNokosMeta(serviceId, numberId = null, providerId = null, force = true) {
+  const label = await serviceLabel(serviceId);
+  const rows = await cachedCountries(serviceId, force); // fresh pas bayar/detail-refresh
+  let row = null;
+  if (numberId) row = (rows || []).find((r) => Number(r.number_id) === Number(numberId));
+  else row = (rows || []).find((r) => r.iso_code === 'id' || /indonesia/i.test(r.name || ''));
+  if (!row) throw new Error('Negara tidak tersedia.');
+  let best = null;
+  if (providerId) {
+    best = (row.pricelist || []).find((p) => String(p.provider_id) === String(providerId) && p.available !== false && Number(p.stock) > 0);
+    if (!best) throw new Error('Provider itu baru aja habis. Balik & pilih lain.');
+  } else {
+    best = cheapestProvider(row);
+  }
+  if (!best) throw new Error('Stok kosong.');
   let operatorId = 1; // 'any' default
   try {
     const ops = await operatorsV2(row.name || 'indonesia', best.provider_id);
     const any = (ops || []).find((o) => String(o.name).toLowerCase() === 'any');
     operatorId = any ? any.id : (ops?.[0]?.id ?? 1);
   } catch {} // fallback any
-  return { cat, row, best, operatorId, jual: sellPrice(best.price) };
+  return { label, row, best, operatorId, jual: sellPrice(best.price) };
 }
 
-bot.action(/^nbuy:(\d+)$/, async (ctx) => {
+function parseBuyArgs(m) {
+  return {
+    serviceId: Number(m[1]),
+    numberId: m[2] ? Number(m[2]) : null,
+    providerId: m[3] ? String(m[3]) : null,
+  };
+}
+
+bot.action(/^nbuy:(\d+)(?::(\d+):([^:]+))?$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!(await isJoinedTesti(ctx.from.id))) { await ctx.reply(`⚠️ Gabung dulu:\n👉 ${config.testiLink}`, joinGateButtons()).catch(() => {}); return; }
   if ((await countActiveNokos(getChatId(ctx))) >= config.nokosMaxActive) {
     await ctx.reply(`❌ Kamu sudah pegang max ${config.nokosMaxActive} nokos aktif. Selesaikan/batalkan dulu.`);
     return;
   }
+  const args = parseBuyArgs(ctx.match);
   let meta = null;
-  try { meta = await prepareNokosMeta(Number(ctx.match[1])); }
+  try { meta = await prepareNokosMeta(args.serviceId, args.numberId, args.providerId); }
   catch (e) { await ctx.reply(`Gagal: ${e.message}`); return; }
+  const ready = await providerReady(meta.best.price);
+  if (!ready.ok) {
+    await ctx.reply(`❌ Stok provider lagi bermasalah (saldo owner kurang). Jangan bayar dulu — hubungi admin.`);
+    await notifyAdmins(`⚠️ NOKOS DITAHAN (QRIS)\n👤 ${ctx.from?.first_name} (${getChatId(ctx)}) mau beli ${meta.label} ${meta.row.name} ${formatRupiah(meta.jual)}.\nSaldo provider: ${formatRupiah(ready.balance)} — KURANG. Topup dashboard (min 2rb).`);
+    return;
+  }
   let qris = null;
   try { qris = await createQris(meta.jual); }
   catch (e) { await ctx.reply(`Gagal bikin QRIS: ${e.message}`); return; }
@@ -1344,7 +1500,8 @@ bot.action(/^nbuy:(\d+)$/, async (ctx) => {
     chatId, buyerName: ctx.from?.first_name || '',
     reference: qris.reference, createdAt: Date.now(), expiredAt: qris.expiredAt,
     total: qris.total, amount: qris.nominal, status: 'pending',
-    serviceId: meta.cat.serviceId, serviceLabel: meta.cat.label,
+    serviceId: args.serviceId, serviceLabel: meta.label,
+    countryLabel: meta.row.name || 'Indonesia',
     numberId: meta.row.number_id, providerId: String(meta.best.provider_id), operatorId: meta.operatorId,
     modal: meta.best.price, jual: meta.jual,
   };
@@ -1353,15 +1510,16 @@ bot.action(/^nbuy:(\d+)$/, async (ctx) => {
   await writeJson(ordersFile, orders);
   startPolling(order.id);
   await sendQrisPhoto(ctx, qris, order,
-    `📱 Nokos ${meta.cat.label} Indo — bayar ${formatRupiah(qris.total)} lewat QR ini.\nNomor diorder OTOMATIS setelah bayar.\n\nReference: ${qris.reference}\n${qrisExpiryText(qris)}`);
+    `📱 Nokos ${meta.label} ${meta.row.name} — bayar ${formatRupiah(qris.total)} lewat QR ini.\nNomor diorder OTOMATIS setelah bayar.\n\nReference: ${qris.reference}\n${qrisExpiryText(qris)}`);
 });
 
-bot.action(/^nbuybal:(\d+)$/, async (ctx) => {
+bot.action(/^nbuybal:(\d+)(?::(\d+):([^:]+))?$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!(await isJoinedTesti(ctx.from.id))) { await ctx.reply(`⚠️ Gabung dulu:\n👉 ${config.testiLink}`, joinGateButtons()).catch(() => {}); return; }
   const chatId = getChatId(ctx);
+  const args = parseBuyArgs(ctx.match);
   let meta = null;
-  try { meta = await prepareNokosMeta(Number(ctx.match[1])); }
+  try { meta = await prepareNokosMeta(args.serviceId, args.numberId, args.providerId); }
   catch (e) { await ctx.reply(`Gagal: ${e.message}`); return; }
   const users = await readJson(usersFile);
   const bal = Number(users?.[chatId]?.balance || 0);
@@ -1373,21 +1531,45 @@ bot.action(/^nbuybal:(\d+)$/, async (ctx) => {
     await ctx.reply(`❌ Max ${config.nokosMaxActive} nokos aktif.`);
     return;
   }
+  // Cek saldo OWNER di provider dulu — jangan potong user kalau owner tekor.
+  const ready = await providerReady(meta.best.price);
+  if (!ready.ok) {
+    await ctx.reply(`❌ Stok provider lagi bermasalah (saldo owner kurang / error: ${ready.error || formatRupiah(ready.balance)}).\n💰 Saldo kamu AMAN, tidak kepotong. Hubungi admin.`);
+    await notifyAdmins(`⚠️ NOKOS DITAHAN\n👤 ${ctx.from?.first_name} (${chatId}) mau beli ${meta.label} ${meta.row.name} ${formatRupiah(meta.jual)}, modal ${formatRupiah(meta.best.price)}.\nSaldo provider: ${formatRupiah(ready.balance)} — KURANG. Topup di dashboard rumahotp (min 2rb).`);
+    return;
+  }
+  // Order ke provider DULU, potong saldo user KALAU sukses. Urutan ini anti-rugi.
+  let ro = null;
+  try {
+    ro = await createOrderV2(meta.row.number_id, String(meta.best.provider_id), meta.operatorId);
+  } catch (e) {
+    await ctx.reply(`❌ Gagal order nomor ke provider: ${e.message}\n💰 Saldo kamu AMAN, tidak kepotong.`);
+    await notifyAdmins(`🚨 NOKOS GAGAL (saldo user aman)\n👤 ${ctx.from?.first_name} (${chatId})\n📦 ${meta.label} ${meta.row.name} — provider gagal: ${e.message}`);
+    return;
+  }
   users[chatId] = { ...(users[chatId] || {}), balance: bal - meta.jual, name: ctx.from?.first_name || users[chatId]?.name };
   const order = {
-    id: randomUUID(), kind: 'nokos_pending', payMethod: 'balance',
+    id: randomUUID(), kind: 'nokos', payMethod: 'balance',
     chatId, buyerName: ctx.from?.first_name || '',
-    reference: null, createdAt: Date.now(), total: meta.jual, status: 'pending',
-    serviceId: meta.cat.serviceId, serviceLabel: meta.cat.label,
+    reference: null, createdAt: Date.now(), activatedAt: Date.now(), total: meta.jual, status: 'active',
+    serviceId: args.serviceId, serviceLabel: meta.label,
+    countryLabel: meta.row.name || 'Indonesia',
     numberId: meta.row.number_id, providerId: String(meta.best.provider_id), operatorId: meta.operatorId,
     modal: meta.best.price, jual: meta.jual,
+    roOrderId: ro.order_id, phone: ro.phone_number, lastCode: null,
   };
   const orders = await readJson(ordersFile);
   orders[order.id] = order;
   await writeJson(usersFile, users);
   await writeJson(ordersFile, orders);
-  await ctx.reply(`💰 Saldo kepotong ${formatRupiah(meta.jual)}. Order nomor ke provider...`);
-  await activateNokos(order.id);
+  startNokosPoll(order.id);
+  await ctx.reply(
+    `📱 Nokos aktif!\n━━━━━━━━━━━━\n📦 ${meta.label} — ${meta.row.name || 'Indonesia'}\n📞 Nomor: \`${ro.phone_number}\`\n🆔 Order: ${ro.order_id}\n💰 Saldo kepotong ${formatRupiah(meta.jual)}.\n⏰ Aktif ${config.nokosTimeoutMinutes} menit, OTP otomatis diteruskan ke sini.`,
+    { parse_mode: 'Markdown', ...nokosButtons(order.id) }
+  );
+  try {
+    await notifyAdmins(`📱 Nokos laku!\n👤 ${order.buyerName} (${chatId})\n📦 ${meta.label} ${ro.phone_number}\n💰 ${formatRupiah(meta.jual)} via SALDO\nRef: ${order.id.slice(0, 8)}`);
+  } catch {}
 });
 
 bot.action(/^nkd:(.+)$/, async (ctx) => {
