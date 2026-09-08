@@ -31,11 +31,11 @@ const UNIT_PRICE = Math.round(PRICE / 2);
 
 const config = {
   qrisToken: process.env.QRIS_TOKEN,
-  topupUrl: process.env.QRIS_TOPUP_URL || 'https://qris.zakki.store/topup',
-  // Default ke endpoint resmi zakki.store (GET ?idtopup=...).
-  // Bisa dioverride pakai endpoint custom POST { token, reference }.
-  statusUrl: process.env.QRIS_STATUS_URL || 'https://qris.zakki.store/cektopup',
-  cancelUrl: process.env.QRIS_CANCEL_URL || 'https://qris.zakki.store/cancel',
+  // XentraPay: semua endpoint GET pakai ?apikey=... (lihat https://app.xentrapay.xyz/docs)
+  // QRIS_TOKEN di .env sekarang = XentraPay apikey (mgcloudpay_...).
+  topupUrl: process.env.QRIS_TOPUP_URL || 'https://app.xentrapay.xyz/api/invoice',
+  statusUrl: process.env.QRIS_STATUS_URL || 'https://app.xentrapay.xyz/api/invoice/status',
+  cancelUrl: process.env.QRIS_CANCEL_URL || '', // XentraPay tak ada cancel API -> batal lokal saja
   pollSeconds: Number(process.env.PAYMENT_POLL_SECONDS || 15),
   timeoutMinutes: Number(process.env.PAYMENT_TIMEOUT_MINUTES || 10),
   // Total kapasitas stok untuk bar persen. Isi mis. 102. Kalau 0/kosong, total = sisa saat ini.
@@ -91,77 +91,32 @@ function withStockLock(fn) {
   return next;
 }
 
-// ---- Helpers QRIS (sesuai docs https://qris.zakki.store) ----
-// Topup sukses:
-// { code:201, data:{ id_transaksi, rincian:{total_bayar}, expired_at, qris_image, qris_content, cancel_url, cektopup_url } }
-// Cek sukses-pending:
-// { kategori_status:"PENDING"|"SUCCESS", data:{ status:"PENDING"|"SUCCESS", id_transaksi } }
+// ---- Helpers QRIS (XentraPay — verified live 2026-09-08) ----
+// Create:  GET /api/invoice?apikey=KEY&amount=N
+//   -> { success:true, invoice_id, amount, fee, total, qris_image, payment_link, expired_at }
+// Status:  GET /api/invoice/status?apikey=KEY&invoice_id=ID
+//   -> { invoice_id, amount, fee, total, status:"pending"|"paid"|..., qris_image, ... }
+// Cancel:  tak ada endpoint cancel di XentraPay -> batal lokal (stop polling, tandai cancelled).
+//   Invoice yang tak dibayar expired sendiri (±15 mnt, lihat expired_at).
 
 function paymentImage(response) {
-  return (
-    response.qr_url ||
-    response.qris_url ||
-    response.payment_url ||
-    response.url ||
-    response.image ||
-    response.qris_image ||
-    response.data?.qr_url ||
-    response.data?.qris_url ||
-    response.data?.payment_url ||
-    response.data?.url ||
-    response.data?.qris_image ||
-    response.data?.image_url ||
-    response.data?.qris_data?.image_url ||
-    null
-  );
-}
-
-function paymentContent(response) {
-  return (
-    response.qris_content ||
-    response.data?.qris_content ||
-    response.data?.qris_data?.raw_string ||
-    null
-  );
+  return response.qris_image || response.qr_image || response.image || null;
 }
 
 function paymentReference(response) {
-  return (
-    response.reference ||
-    response.transaction_id ||
-    response.id_transaksi ||
-    response.id ||
-    response.file_id ||
-    response.data?.reference ||
-    response.data?.transaction_id ||
-    response.data?.id_transaksi ||
-    response.data?.id ||
-    response.file_id ||
-    null
-  );
+  return response.invoice_id || null;
 }
 
 function paymentTotal(response, fallback = PRICE) {
-  return (
-    response.total_bayar ||
-    response.data?.rincian?.total_bayar ||
-    response.data?.nominal_total ||
-    response.data?.rincian?.nominal_request ||
-    fallback
-  );
+  return response.total || response.amount || fallback;
 }
 
-// Nominal asli yang diminta (tanpa kode unik) — untuk kredit saldo deposit.
 function paymentNominal(response, fallback) {
-  return (
-    response.data?.rincian?.nominal_request ||
-    response.nominal_request ||
-    fallback
-  );
+  return response.amount || fallback;
 }
 
 function paymentExpiredAt(response) {
-  return response.expired_at || response.data?.expired_at || null;
+  return response.expired_at || null;
 }
 
 const PAID_STATUSES = new Set([
@@ -193,29 +148,28 @@ function getChatId(ctx) {
 }
 
 async function createQris(nominal = PRICE) {
-  const response = await fetch(config.topupUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token: config.qrisToken, nominal }),
-  });
+  const url = `${config.topupUrl}${config.topupUrl.includes('?') ? '&' : '?'}apikey=${encodeURIComponent(config.qrisToken)}&amount=${encodeURIComponent(nominal)}`;
+  const response = await fetch(url, { method: 'GET' });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.message || `QRIS HTTP ${response.status}`);
+  if (!response.ok || body.success === false)
+    throw new Error(body.message || body.error || `QRIS HTTP ${response.status}`);
   const image = paymentImage(body);
   const reference = paymentReference(body);
   if (!image || !reference) {
     throw new Error(
-      `Respons topup tidak dikenali (butuh qris_image + id_transaksi). Dapat: ${JSON.stringify(body).slice(0, 300)}`
+      `Respons invoice tak dikenali (butuh qris_image + invoice_id). Dapat: ${JSON.stringify(body).slice(0, 300)}`
     );
   }
   return {
     image,
-    content: paymentContent(body),
+    content: null,
     reference,
     total: paymentTotal(body, nominal),
     nominal: paymentNominal(body, nominal),
     expiredAt: paymentExpiredAt(body),
-    cancelUrl: body.cancel_url || body.data?.cancel_url || null,
-    checkUrl: body.cektopup_url || body.data?.cektopup_url || null,
+    cancelUrl: null,
+    checkUrl: body.payment_link || null,
+    paymentLink: body.payment_link || null,
     raw: body,
   };
 }
@@ -223,38 +177,17 @@ async function createQris(nominal = PRICE) {
 async function checkPayment(order) {
   const reference = order.reference;
   if (!reference) return false;
-
-  // Jalur resmi zakki.store: GET /cektopup?idtopup=xxx
-  if (config.statusUrl.includes('cektopup')) {
-    const url = `${config.statusUrl}${config.statusUrl.includes('?') ? '&' : '?'}idtopup=${encodeURIComponent(reference)}`;
-    const response = await fetch(url, { method: 'GET' });
-    const body = await response.json().catch(() => ({}));
-    if (response.status === 404) return false; // belum ada / tidak ditemukan = belum bayar
-    if (!response.ok) throw new Error(body.message || `Status QRIS HTTP ${response.status}`);
-    return paid(body);
-  }
-
-  // Fallback endpoint custom: POST { token, reference }
-  const response = await fetch(config.statusUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token: config.qrisToken, reference }),
-  });
+  const url = `${config.statusUrl}${config.statusUrl.includes('?') ? '&' : '?'}apikey=${encodeURIComponent(config.qrisToken)}&invoice_id=${encodeURIComponent(reference)}`;
+  const response = await fetch(url, { method: 'GET' });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.message || `Status QRIS HTTP ${response.status}`);
+  if (response.status === 404) return false; // invoice tak ada = belum bayar / salah id
+  if (!response.ok) throw new Error(body.message || body.error || `Status QRIS HTTP ${response.status}`);
   return paid(body);
 }
 
-// Batalkan tiket QRIS pending di zakki.store: GET /cancel?token=...&id_transaksi=...
+// XentraPay tak sediakan cancel API: batal = stop polling + tandai cancelled lokal.
+// Invoice pending expired otomatis (±15 mnt). Tak ada dana ketahan karena belum dibayar.
 async function cancelPayment(order) {
-  const reference = order.reference;
-  if (!reference) return true;
-  const url = `${config.cancelUrl}${config.cancelUrl.includes('?') ? '&' : '?'}token=${encodeURIComponent(config.qrisToken)}&id_transaksi=${encodeURIComponent(reference)}`;
-  const response = await fetch(url, { method: 'GET' });
-  const body = await response.json().catch(() => ({}));
-  // 404 = sudah tidak ada / kadaluarsa -> anggap sudah batal
-  if (response.status === 404) return true;
-  if (!response.ok) throw new Error(body.message || `Cancel QRIS HTTP ${response.status}`);
   return true;
 }
 
@@ -268,7 +201,9 @@ async function notifyAdmins(text) {
   for (const id of config.adminIds) {
     try {
       await bot.telegram.sendMessage(id, text);
-    } catch {}
+    } catch (e) {
+      console.error(`Gagal notif admin ${id} (cek ADMIN_IDS & admin sudah /start bot):`, e.message);
+    }
   }
 }
 
@@ -354,7 +289,9 @@ async function sendTesti(kind, { name, detail, amount, ref }) {
   // Fallback teks kalau sharp belum diinstall / gagal
   try {
     await bot.telegram.sendMessage(config.testiGroupId, `${caption}\nRef: ${ref}`);
-  } catch {}
+  } catch (e) {
+    console.error('Gagal kirim testimoni ke grup (cek TESTI_GROUP_ID & bot sudah masuk grup):', e.message);
+  }
 }
 
 // Dipanggil tiap pembelian QRIS/saldo sukses: notif admin + testimoni grup.
@@ -1012,6 +949,9 @@ await resumePolling();
 console.log('Menghubungkan ke Telegram...');
 console.log(`Topup: ${config.topupUrl}`);
 console.log(`Status: ${config.statusUrl}`);
+getSharp().then((s) =>
+  console.log(s ? 'Testimoni gambar: AKTIF (sharp)' : 'Testimoni gambar: TEKS SAJA (sharp belum diinstall — jalankan npm install)')
+);
 
 // Jangan await launch: Telegraf long-polling tidak resolve selama jalan,
 // dan kalau token dipakai di 2 tempat (VPS + localhost) bakal 409 Conflict.
