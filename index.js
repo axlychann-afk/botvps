@@ -46,6 +46,9 @@ const config = {
   vpsSpecs: String(process.env.VPS_SPECS || 'Xeon Platinum 8581C (32 Core),RAM 258GB DDR5,NVMe SSD,Google Cloud Network').split(',').map((s) => s.trim()).filter(Boolean),
   adminIds: String(process.env.ADMIN_IDS || '').split(',').map((s) => s.trim()).filter(Boolean),
   testiGroupId: process.env.TESTI_GROUP_ID || '',
+  promoGroupId: process.env.PROMO_GROUP_ID || '',
+  testiLink: process.env.TESTI_LINK || 'https://t.me/testimonialnat',
+  promoLink: process.env.PROMO_LINK || '',
   shopName: process.env.SHOP_NAME || 'VPS NAT Store',
 };
 
@@ -216,6 +219,37 @@ async function getBalance(chatId) {
     return Number(users?.[chatId]?.balance || 0);
   } catch {
     return 0;
+  }
+}
+
+// ---- Wajib join GB Testimoni + Broadcast ke GB Promosi ----
+async function isJoinedTesti(userId) {
+  if (!config.testiGroupId) return true; // fitur mati kalau ID belum diset
+  try {
+    const m = await bot.telegram.getChatMember(config.testiGroupId, userId);
+    return ['creator', 'administrator', 'member', 'restricted'].includes(m?.status);
+  } catch {
+    return false; // bot belum masuk grup / ID salah -> anggap belum join biar ketahuan
+  }
+}
+
+function joinGateButtons() {
+  const rows = [[Markup.button.url('⭐ Gabung GB Testimoni', config.testiLink)]];
+  rows.push([Markup.button.callback('✅ Saya Sudah Gabung', 'cek_join')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+async function sendToPromo(ctx, text, extra = {}) {
+  if (!config.promoGroupId) {
+    await ctx.reply('❌ PROMO_GROUP_ID belum diset di .env.\nIsi ID grup promosi (bot harus sudah masuk jadi admin/member di sana), lalu restart bot.');
+    return false;
+  }
+  try {
+    await bot.telegram.sendMessage(config.promoGroupId, text, extra);
+    return true;
+  } catch (e) {
+    await ctx.reply(`❌ Gagal kirim ke GB Promosi: ${e.message}\nPastikan bot sudah MASUK ke grup promosi & ID benar.`);
+    return false;
   }
 }
 
@@ -707,7 +741,7 @@ async function buildStart(name, chatId) {
         [Markup.button.callback('💰 Beli pakai Saldo', 'buy_balance'), Markup.button.callback('➕ Top Up', 'topup')],
       ];
   rows.push([Markup.button.callback('🖥 Lihat Spek (Gambar)', 'lihat_spek')]);
-  rows.push([Markup.button.url('⭐ Testimoni', 'https://t.me/testimonialnat')]);
+  rows.push([Markup.button.url('⭐ Testimoni', config.testiLink)]);
   return { text, buttons: Markup.inlineKeyboard(rows) };
 }
 
@@ -760,6 +794,18 @@ function menuCaption(name, balance, remaining, total, percent, dot, empty) {
 bot.start(async (ctx) => {
   const name = ctx.from?.first_name || 'kak';
   const chatId = getChatId(ctx);
+  // GATE: wajib gabung GB Testimoni dulu sebelum menu utama muncul
+  const joined = await isJoinedTesti(ctx.from.id);
+  if (!joined) {
+    await ctx.reply(
+      `Halo, ${name}! 👋\n\n` +
+      `Sebelum bisa order, kamu WAJIB gabung dulu ke GB Testimoni kami:\n` +
+      `👉 ${config.testiLink}\n\n` +
+      `Klik tombol di bawah untuk gabung, lalu pencet "✅ Saya Sudah Gabung".`,
+      joinGateButtons()
+    );
+    return;
+  }
   const { text, buttons } = await buildStart(name, chatId);
   // Gabung: 1 pesan foto (kartu spek) + caption menu + tombol. Fallback teks bila render gagal.
   const photo = await specPhoto();
@@ -843,6 +889,11 @@ function qrisExpiryText(qris) {
 
 bot.action('buy', async (ctx) => {
   try {
+    if (!(await isJoinedTesti(ctx.from.id))) {
+      await ctx.answerCbQuery('Gabung GB Testimoni dulu!');
+      await ctx.reply(`⚠️ Wajib gabung GB Testimoni dulu sebelum order:\n👉 ${config.testiLink}`, joinGateButtons()).catch(() => {});
+      return;
+    }
     const stock = await readJson(stockFile);
     if (!Array.isArray(stock) || stock.length < 1) return ctx.answerCbQuery('Stok habis.');
   } catch (e) {
@@ -885,6 +936,10 @@ const TOPUP_OPTIONS = [10000, 20000, 50000, 100000];
 
 bot.action('topup', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
+  if (!(await isJoinedTesti(ctx.from.id))) {
+    await ctx.reply(`⚠️ Wajib gabung GB Testimoni dulu sebelum top up:\n👉 ${config.testiLink}`, joinGateButtons()).catch(() => {});
+    return;
+  }
   await ctx.reply(
     `➕ Top Up Saldo\nPilih nominal (saldo masuk sebesar nominal ini, kode unik tidak dihitung):`,
     Markup.inlineKeyboard([
@@ -932,6 +987,11 @@ bot.action(/^topup:(\d+)$/, async (ctx) => {
 
 // ---- Beli pakai saldo ----
 bot.action('buy_balance', async (ctx) => {
+  if (!(await isJoinedTesti(ctx.from.id))) {
+    await ctx.answerCbQuery('Gabung GB Testimoni dulu!');
+    await ctx.reply(`⚠️ Wajib gabung GB Testimoni dulu sebelum order:\n👉 ${config.testiLink}`, joinGateButtons()).catch(() => {});
+    return;
+  }
   const chatId = getChatId(ctx);
   const buyerName = ctx.from?.first_name || '';
   const result = await withStockLock(async () => {
@@ -1027,7 +1087,115 @@ bot.action(/^cancel:(.+)$/, async (ctx) => {
   }
 });
 
+bot.action('cek_join', async (ctx) => {
+  const joined = await isJoinedTesti(ctx.from.id);
+  if (!joined) {
+    await ctx.answerCbQuery('Kamu belum gabung. Join dulu ya!');
+    await ctx.reply(
+      `❌ Belum terdeteksi join.\nGabung dulu: 👉 ${config.testiLink}\nLalu pencet tombol di bawah lagi.`,
+      joinGateButtons()
+    ).catch(() => {});
+    return;
+  }
+  await ctx.answerCbQuery('✅ Terima kasih sudah gabung!');
+  const name = ctx.from?.first_name || 'kak';
+  const { text, buttons } = await buildStart(name, getChatId(ctx));
+  const photo = await specPhoto();
+  if (photo) {
+    const remaining = await getStockCount();
+    const balance = await getBalance(getChatId(ctx));
+    const total = config.stockTotal > 0 ? config.stockTotal : Math.max(remaining, 1);
+    const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
+    const dot = remaining < 1 ? '🔴' : percent < 30 ? '🟡' : '🟢';
+    await ctx.replyWithPhoto({ source: photo }, {
+      caption: menuCaption(name, balance, remaining, total, percent, dot, remaining < 1),
+      ...buttons,
+    }).catch(async () => { await ctx.reply(text, buttons); });
+    return;
+  }
+  await ctx.reply(text, buttons);
+});
+
 // ---- Perintah admin ----
+// /admin — panel khusus admin
+bot.command('admin', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  await ctx.reply(
+    `🛠 Panel Admin — ${config.shopName}\n` +
+    `GB Promosi: ${config.promoGroupId || '(belum diset)'}\n` +
+    `GB Testimoni: ${config.testiGroupId || '(belum diset)'}\n\n` +
+    `Pilih aksi:`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback('📢 Broadcast Teks ke GB Promosi', 'bc_help')],
+      [Markup.button.callback('📊 Cek Stok', 'adm_stok'), Markup.button.callback('🧾 Riwayat', 'adm_riwayat')],
+    ])
+  );
+});
+
+bot.action('bc_help', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  await ctx.reply(
+    `📢 BROADCAST PROMOSI (khusus admin)\n\n` +
+    `Cara 1 — teks langsung:\n/broadcast teks promosi disini...\n\n` +
+    `Cara 2 — forward media:\nReply foto/video/dokumen dengan /broadcast, caption ikut terkirim.\n\n` +
+    `Target: GB Promosi (${config.promoGroupId || 'belum diset'}).\n` +
+    `Pastikan bot sudah MASUK ke grup promosi sebagai admin/member.`
+  );
+});
+
+bot.action('adm_stok', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const remaining = await getStockCount();
+  await ctx.reply(`📊 Stok VPS: ${remaining} unit.`);
+});
+
+bot.action('adm_riwayat', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const orders = await readJson(ordersFile);
+  const list = Object.values(orders).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 5);
+  if (!list.length) { await ctx.reply('Belum ada order.'); return; }
+  await ctx.reply(`🧾 5 order terakhir:\n` + list.map((o) => `• ${o.buyerName || o.chatId} — ${o.status} — ${formatRupiah(o.kind === 'topup' ? o.amount : o.total)}`).join('\n'));
+});
+
+// /broadcast <teks> — khusus admin, kirim ke GB Promosi.
+// Kalau dipakai sambil reply foto/video/dokumen, media ikut diteruskan + caption.
+bot.command('broadcast', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  if (!config.promoGroupId) {
+    await ctx.reply('❌ PROMO_GROUP_ID belum diset.\n1. Masukkan bot ke GB Promosi\n2. Isi PROMO_GROUP_ID di .env dengan ID grup (cth: -100xxxx)\n3. Restart bot, coba lagi.');
+    return;
+  }
+  const msg = ctx.message || {};
+  const reply = msg.reply_to_message;
+  const text = (msg.text || '').replace(/^\/broadcast(@\w+)?/, '').trim();
+
+  try {
+    // Mode reply media -> copy ke grup promosi
+    if (reply && (reply.photo || reply.video || reply.document || reply.animation)) {
+      const cap = text || reply.caption || '';
+      if (reply.photo) {
+        const fid = reply.photo[reply.photo.length - 1].file_id;
+        await bot.telegram.sendPhoto(config.promoGroupId, fid, { caption: cap.slice(0, 1000) });
+      } else if (reply.video) {
+        await bot.telegram.sendVideo(config.promoGroupId, reply.video.file_id, { caption: cap.slice(0, 1000) });
+      } else if (reply.animation) {
+        await bot.telegram.sendAnimation(config.promoGroupId, reply.animation.file_id, { caption: cap.slice(0, 1000) });
+      } else if (reply.document) {
+        await bot.telegram.sendDocument(config.promoGroupId, reply.document.file_id, { caption: cap.slice(0, 1000) });
+      }
+      await ctx.reply('✅ Broadcast media terkirim ke GB Promosi.');
+      return;
+    }
+    if (!text) {
+      await ctx.reply('Format:\n/broadcast teks promosi disini...\natau reply foto/video dengan /broadcast caption');
+      return;
+    }
+    const ok = await sendToPromo(ctx, `📢 PROMO ${config.shopName}\n━━━━━━━━━━━━\n\n${text}\n\n━━━━━━━━━━━━\n🤖 Order: @${ctx.botInfo?.username || 'bot ini'} | ⭐ Testi: ${config.testiLink}`);
+    if (ok) await ctx.reply('✅ Broadcast terkirim ke GB Promosi.');
+  } catch (e) {
+    await ctx.reply(`❌ Gagal broadcast: ${e.message}`);
+  }
+});
 bot.command('stok', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const remaining = await getStockCount();
