@@ -837,31 +837,23 @@ async function buildStart(name, chatId) {
   ].filter(Boolean).join('\n');
   const text =
     `✦ ${config.shopName} ✦\n` +
-    `VPS NAT Premium — Cepat, Stabil, Terpercaya\n` +
-    `━━━━━━━━━━━━━━━━━━\n\n` +
-    `Halo, ${name}! 👋\n` +
-    `Selamat datang di layanan auto-order kami.\n\n` +
-    `💰 Saldo Anda : ${formatRupiah(balance)} | 📱 OTP : ${formatRupiah(otpBal)}\n\n` +
-    `📦 Produk : VPS NAT\n` +
-    `│  • Harga : ${formatRupiah(UNIT_PRICE)} / unit\n` +
+    `Halo, ${name}! 👋\n\n` +
+    `💰 VPS: ${formatRupiah(balance)} | 📱 OTP: ${formatRupiah(otpBal)}\n\n` +
+    `🖥️ VPS NAT — ${formatRupiah(UNIT_PRICE)}/unit\n` +
     `${specLines ? specLines + '\n' : ''}` +
     `${liveLines ? liveLines + '\n' : ''}` +
-    `└ Spesifikasi : ${config.productSpec}\n\n` +
-    `📊 Stok : ${dot} ${remaining}/${total} unit (${percent}%)\n` +
-    `${stockBar(percent)}\n` +
-    (empty ? `\n❌ Stok sedang habis — coba lagi nanti.\n` : ``) +
-    `\n━━━━━━━━━━━━━━━━━━\n` +
-    `⚡ Proses otomatis setelah pembayaran\n` +
-    `🔒 Aman & terpercaya — bukti order di channel testimoni`;
+    `└ ${config.productSpec}\n\n` +
+    `📊 Stok: ${dot} ${remaining}/${total} ${stockBar(percent)}\n` +
+    (empty ? `❌ Stok habis — coba lagi nanti.\n` : ``) +
+    `⚡ Auto-order setelah bayar, bukti di channel testimoni`;
   const rows = empty
     ? [[Markup.button.callback('🔄 Cek Stok', 'cek_stok')]]
     : [
-        [Markup.button.callback(`🛒 Beli 1 VPS • ${formatRupiah(PRICE)} (QRIS)`, 'buy')],
-        [Markup.button.callback('💰 Beli pakai Saldo', 'buy_balance'), Markup.button.callback('➕ Top Up', 'topup')],
+        [Markup.button.callback(`🛒 Beli VPS • ${formatRupiah(PRICE)}`, 'buy')],
+        [Markup.button.callback('📱 Beli Nokos (OTP)', 'nokos'), Markup.button.callback('💰 VPS via Saldo', 'buy_balance')],
+        [Markup.button.callback('💳 Saldo Saya', 'saldo'), Markup.button.callback('➕ Top Up', 'topup')],
       ];
-  rows.push([Markup.button.callback('🆘 Mengalami masalah? Contact Admin', 'contact_help')]);
-  rows.push([Markup.button.url('⭐ Testimoni', config.testiLink)]);
-  if (!empty) rows.splice(2, 0, [Markup.button.callback('📱 Beli Nokos (OTP) • WA/TG Indo', 'nokos')]);
+  rows.push([Markup.button.callback('🆘 Bantuan', 'contact_help'), Markup.button.url('⭐ Testimoni', config.testiLink)]);
   return { text, buttons: Markup.inlineKeyboard(rows) };
 }
 
@@ -957,6 +949,15 @@ bot.action('cek_stok', async (ctx) => {
 });
 
 bot.command('saldo', async (ctx) => {
+  await showSaldo(ctx);
+});
+
+bot.action('saldo', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  await showSaldo(ctx);
+});
+
+async function showSaldo(ctx) {
   const chatId = getChatId(ctx);
   const balance = await getBalance(chatId);
   const otpBal = await getOtpBalance(chatId);
@@ -967,7 +968,7 @@ bot.command('saldo', async (ctx) => {
       [Markup.button.callback(`💰 Beli 1 VPS — ${formatRupiah(PRICE)}`, 'buy_balance')],
     ])
   );
-});
+}
 
 // Kirim QR sebagai foto (tanpa link): gambar di-download server lalu di-upload
 // sebagai file, jadi Telegram tidak perlu fetch URL host gambar (sering gagal).
