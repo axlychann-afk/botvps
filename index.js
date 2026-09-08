@@ -14,6 +14,7 @@ const stockFile = path.join(dataDir, 'vps_stock.json');
 const stockExampleFile = path.join(dataDir, 'vps_stock.example.json');
 const ordersFile = path.join(dataDir, 'orders.json');
 const usersFile = path.join(dataDir, 'users.json');
+const groupsFile = path.join(dataDir, 'group_config.json');
 
 // ---- Validasi env ----
 const required = ['BOT_TOKEN', 'QRIS_TOKEN'];
@@ -68,6 +69,11 @@ async function ensureData() {
     await access(usersFile, constants.F_OK);
   } catch {
     await writeJson(usersFile, {});
+  }
+  try {
+    await access(groupsFile, constants.F_OK);
+  } catch {
+    await writeJson(groupsFile, {});
   }
   try {
     await access(stockFile, constants.F_OK);
@@ -224,9 +230,10 @@ async function getBalance(chatId) {
 
 // ---- Wajib join GB Testimoni + Broadcast ke GB Promosi ----
 async function isJoinedTesti(userId) {
-  if (!config.testiGroupId) return true; // fitur mati kalau ID belum diset
+  const gid = await getTestiId();
+  if (!gid) return true; // fitur mati kalau ID belum diset
   try {
-    const m = await bot.telegram.getChatMember(config.testiGroupId, userId);
+    const m = await bot.telegram.getChatMember(gid, userId);
     return ['creator', 'administrator', 'member', 'restricted'].includes(m?.status);
   } catch {
     return false; // bot belum masuk grup / ID salah -> anggap belum join biar ketahuan
@@ -240,17 +247,62 @@ function joinGateButtons() {
 }
 
 async function sendToPromo(ctx, text, extra = {}) {
-  if (!config.promoGroupId) {
-    await ctx.reply('❌ PROMO_GROUP_ID belum diset di .env.\nIsi ID grup promosi (bot harus sudah masuk jadi admin/member di sana), lalu restart bot.');
+  const { list } = await getPromoTargets();
+  if (!list.length) {
+    await ctx.reply('❌ Bot belum masuk grup promosi manapun.\nAdd bot ke GB promosi (nama bebas, acak juga oke), lalu /broadcast lagi.\nYang perlu /settesti cuma GB TESTIMONI.');
     return false;
   }
+  let ok = 0;
+  for (const target of list) {
+    try {
+      await bot.telegram.sendMessage(target, text, extra);
+      ok++;
+    } catch (e) {
+      console.error(`Gagal kirim promosi ke ${target}:`, e.message);
+    }
+  }
+  if (!ok) {
+    await ctx.reply('❌ Gagal kirim ke semua GB. Pastikan bot masih ada di grup & jadi admin/member.');
+    return false;
+  }
+  return true;
+}
+
+// ID grup auto-daftar (tanpa copy manual): .env dulu, kalau kosong pakai data/group_config.json
+async function getPromoId() {
+  if (config.promoGroupId) return config.promoGroupId;
   try {
-    await bot.telegram.sendMessage(config.promoGroupId, text, extra);
-    return true;
-  } catch (e) {
-    await ctx.reply(`❌ Gagal kirim ke GB Promosi: ${e.message}\nPastikan bot sudah MASUK ke grup promosi & ID benar.`);
-    return false;
-  }
+    const g = await readJson(groupsFile);
+    if (Array.isArray(g?.promoGroups) && g.promoGroups.length) return g.promoGroups[0];
+    return g?.promoGroupId || '';
+  } catch { return ''; }
+}
+// Semua target broadcast: semua grup yang dikenal KECUALI grup testimoni.
+// Jadi GB apapun yang bot dimasukin otomatis jadi target promosi.
+async function getPromoTargets() {
+  try {
+    const g = await readJson(groupsFile);
+    const testi = config.testiGroupId || g?.testiGroupId || '';
+    let list = [];
+    if (Array.isArray(g?.promoGroups)) list = [...g.promoGroups];
+    if (g?.promoGroupId) list.push(String(g.promoGroupId));
+    if (config.promoGroupId) list.push(String(config.promoGroupId));
+    list = [...new Set(list.map(String))].filter((id) => id && id !== String(testi));
+    return { list, testi: String(testi) };
+  } catch { return { list: config.promoGroupId ? [String(config.promoGroupId)] : [], testi: '' }; }
+}
+async function getTestiId() {
+  if (config.testiGroupId) return config.testiGroupId;
+  try {
+    const g = await readJson(groupsFile);
+    return g?.testiGroupId || '';
+  } catch { return ''; }
+}
+async function saveGroupId(key, value) {
+  let g = {};
+  try { g = await readJson(groupsFile); } catch {}
+  g[key] = value;
+  await writeJson(groupsFile, g);
 }
 
 // ---- Testimoni gambar (dark modern, sharp SVG -> PNG) ----
@@ -388,7 +440,8 @@ bot.action('lihat_spek', async (ctx) => {
   await sendSpecCard(ctx);
 });
 async function sendTesti(kind, { name, detail, amount, ref }) {
-  if (!config.testiGroupId) return;
+  const gid = await getTestiId();
+  if (!gid) return;
   const title = kind === 'topup' ? 'TESTIMONI DEPOSIT' : 'TESTIMONI PEMBELIAN';
   const date = new Date().toLocaleString('id-ID');
   const caption = `✅ ${title}\n👤 ${name}\n📦 ${detail}\n💰 ${amount}\n📅 ${date}`;
@@ -396,7 +449,7 @@ async function sendTesti(kind, { name, detail, amount, ref }) {
   if (sharp) {
     try {
       const buf = await sharp(Buffer.from(testiSvg({ title, name, detail, amount, date, ref }))).png().toBuffer();
-      await bot.telegram.sendPhoto(config.testiGroupId, { source: buf }, { caption });
+      await bot.telegram.sendPhoto(gid, { source: buf }, { caption });
       return;
     } catch (e) {
       console.error('Gagal bikin gambar testimoni:', e.message);
@@ -404,7 +457,7 @@ async function sendTesti(kind, { name, detail, amount, ref }) {
   }
   // Fallback teks kalau sharp belum diinstall / gagal
   try {
-    await bot.telegram.sendMessage(config.testiGroupId, `${caption}\nRef: ${ref}`);
+    await bot.telegram.sendMessage(gid, `${caption}\nRef: ${ref}`);
   } catch (e) {
     console.error('Gagal kirim testimoni ke grup (cek TESTI_GROUP_ID & bot sudah masuk grup):', e.message);
   }
@@ -1117,13 +1170,54 @@ bot.action('cek_join', async (ctx) => {
 });
 
 // ---- Perintah admin ----
+// /settesti — SATU-SATUNYA command wajib, ketik DI DALAM GB Testimoni.
+// /setpromo — opsional, buat daftarin grup manual kalau event auto ke-skip.
+bot.command('setpromo', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  if (ctx.chat?.type === 'private') {
+    const { list } = await getPromoTargets();
+    await ctx.reply(`📢 Target promosi saat ini (${list.length}):\n${list.join('\n') || '(kosong — add bot ke grup, otomatis masuk)'}\n\nKalau ada grup ke-skip, masuk ke grup itu lalu ketik /setpromo di sana.`);
+    return;
+  }
+  let g = {};
+  try { g = await readJson(groupsFile); } catch {}
+  if (!Array.isArray(g.promoGroups)) g.promoGroups = [];
+  const id = String(ctx.chat.id);
+  if (!g.promoGroups.map(String).includes(id)) g.promoGroups.push(id);
+  // kalau grup ini sempat ketandai testimoni, cabut
+  if (String(g.testiGroupId) === id) delete g.testiGroupId;
+  await saveGroupId('promoGroups', g.promoGroups);
+  await writeJson(groupsFile, g);
+  await ctx.reply(`✅ GB ini terdaftar sebagai TARGET PROMOSI.\nID: ${ctx.chat.id}`);
+});
+bot.command('settesti', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  if (ctx.chat?.type === 'private') {
+    await ctx.reply('Ketik /settesti DI DALAM GB Testimoni (bukan di sini). Cuma grup ini yang perlu ditandai — sisanya otomatis promosi.');
+    return;
+  }
+  const id = String(ctx.chat.id);
+  await saveGroupId('testiGroupId', id);
+  // cabut dari daftar promosi biar broadcast gak nyasar ke sini
+  try {
+    let g = await readJson(groupsFile);
+    if (Array.isArray(g.promoGroups)) {
+      g.promoGroups = g.promoGroups.filter((x) => String(x) !== id);
+      if (g.promoGroupId && String(g.promoGroupId) === id) delete g.promoGroupId;
+      await writeJson(groupsFile, g);
+    }
+  } catch {}
+  await ctx.reply(`✅ GB ini terdaftar sebagai GB TESTIMONI.\nID: ${ctx.chat.id}\nTestimoni otomatis + gate join pakai grup ini. Grup lain (nama bebas/acak) otomatis jadi target broadcast.`);
+});
 // /admin — panel khusus admin
 bot.command('admin', async (ctx) => {
   if (!isAdmin(ctx)) return;
+  const { list } = await getPromoTargets();
+  const tg = await getTestiId();
   await ctx.reply(
     `🛠 Panel Admin — ${config.shopName}\n` +
-    `GB Promosi: ${config.promoGroupId || '(belum diset)'}\n` +
-    `GB Testimoni: ${config.testiGroupId || '(belum diset)'}\n\n` +
+    `GB Promosi: ${list.length} grup (otomatis, nama bebas)\n` +
+    `GB Testimoni: ${tg || '(belum diset — ketik /settesti di grup testimoni)'}\n\n` +
     `Pilih aksi:`,
     Markup.inlineKeyboard([
       [Markup.button.callback('📢 Broadcast Teks ke GB Promosi', 'bc_help')],
@@ -1134,12 +1228,13 @@ bot.command('admin', async (ctx) => {
 
 bot.action('bc_help', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
+  const { list } = await getPromoTargets();
   await ctx.reply(
     `📢 BROADCAST PROMOSI (khusus admin)\n\n` +
     `Cara 1 — teks langsung:\n/broadcast teks promosi disini...\n\n` +
     `Cara 2 — forward media:\nReply foto/video/dokumen dengan /broadcast, caption ikut terkirim.\n\n` +
-    `Target: GB Promosi (${config.promoGroupId || 'belum diset'}).\n` +
-    `Pastikan bot sudah MASUK ke grup promosi sebagai admin/member.`
+    `Target: ${list.length} GB promosi (otomatis semua grup kecuali testimoni).\n` +
+    `Cuma GB Testimoni yang perlu /settesti 1x.`
   );
 });
 
@@ -1157,12 +1252,13 @@ bot.action('adm_riwayat', async (ctx) => {
   await ctx.reply(`🧾 5 order terakhir:\n` + list.map((o) => `• ${o.buyerName || o.chatId} — ${o.status} — ${formatRupiah(o.kind === 'topup' ? o.amount : o.total)}`).join('\n'));
 });
 
-// /broadcast <teks> — khusus admin, kirim ke GB Promosi.
+// /broadcast <teks> — khusus admin, kirim ke SEMUA GB promosi (otomatis).
 // Kalau dipakai sambil reply foto/video/dokumen, media ikut diteruskan + caption.
 bot.command('broadcast', async (ctx) => {
   if (!isAdmin(ctx)) return;
-  if (!config.promoGroupId) {
-    await ctx.reply('❌ PROMO_GROUP_ID belum diset.\n1. Masukkan bot ke GB Promosi\n2. Isi PROMO_GROUP_ID di .env dengan ID grup (cth: -100xxxx)\n3. Restart bot, coba lagi.');
+  const { list } = await getPromoTargets();
+  if (!list.length) {
+    await ctx.reply('❌ Bot belum masuk grup promosi manapun.\nAdd bot ke GB (nama bebas/acak), otomatis jadi target.\nCuma GB Testimoni yang perlu /settesti 1x.');
     return;
   }
   const msg = ctx.message || {};
@@ -1170,20 +1266,26 @@ bot.command('broadcast', async (ctx) => {
   const text = (msg.text || '').replace(/^\/broadcast(@\w+)?/, '').trim();
 
   try {
-    // Mode reply media -> copy ke grup promosi
+    // Mode reply media -> copy ke semua grup promosi
     if (reply && (reply.photo || reply.video || reply.document || reply.animation)) {
       const cap = text || reply.caption || '';
-      if (reply.photo) {
-        const fid = reply.photo[reply.photo.length - 1].file_id;
-        await bot.telegram.sendPhoto(config.promoGroupId, fid, { caption: cap.slice(0, 1000) });
-      } else if (reply.video) {
-        await bot.telegram.sendVideo(config.promoGroupId, reply.video.file_id, { caption: cap.slice(0, 1000) });
-      } else if (reply.animation) {
-        await bot.telegram.sendAnimation(config.promoGroupId, reply.animation.file_id, { caption: cap.slice(0, 1000) });
-      } else if (reply.document) {
-        await bot.telegram.sendDocument(config.promoGroupId, reply.document.file_id, { caption: cap.slice(0, 1000) });
+      let ok = 0;
+      for (const target of list) {
+        try {
+          if (reply.photo) {
+            const fid = reply.photo[reply.photo.length - 1].file_id;
+            await bot.telegram.sendPhoto(target, fid, { caption: cap.slice(0, 1000) });
+          } else if (reply.video) {
+            await bot.telegram.sendVideo(target, reply.video.file_id, { caption: cap.slice(0, 1000) });
+          } else if (reply.animation) {
+            await bot.telegram.sendAnimation(target, reply.animation.file_id, { caption: cap.slice(0, 1000) });
+          } else if (reply.document) {
+            await bot.telegram.sendDocument(target, reply.document.file_id, { caption: cap.slice(0, 1000) });
+          }
+          ok++;
+        } catch (e) { console.error(`Gagal broadcast media ke ${target}:`, e.message); }
       }
-      await ctx.reply('✅ Broadcast media terkirim ke GB Promosi.');
+      await ctx.reply(ok ? `✅ Broadcast media terkirim ke ${ok} GB.` : '❌ Gagal kirim ke semua GB.');
       return;
     }
     if (!text) {
@@ -1191,7 +1293,7 @@ bot.command('broadcast', async (ctx) => {
       return;
     }
     const ok = await sendToPromo(ctx, `📢 PROMO ${config.shopName}\n━━━━━━━━━━━━\n\n${text}\n\n━━━━━━━━━━━━\n🤖 Order: @${ctx.botInfo?.username || 'bot ini'} | ⭐ Testi: ${config.testiLink}`);
-    if (ok) await ctx.reply('✅ Broadcast terkirim ke GB Promosi.');
+    if (ok) await ctx.reply(`✅ Broadcast terkirim ke ${list.length} GB.`);
   } catch (e) {
     await ctx.reply(`❌ Gagal broadcast: ${e.message}`);
   }
@@ -1252,6 +1354,37 @@ bot.command('riwayat', async (ctx) => {
     return `• ${date}\n  ${kind} ${amt} — ${o.status} — ${(o.buyerName || o.chatId)} — ${(o.reference || o.id || '').toString().slice(0, 18)}`;
   });
   await ctx.reply(`🧾 ${list.length} order terakhir:\n\n${lines.join('\n\n').slice(0, 3500)}`);
+});
+
+// Bot baru masuk grup (di-add / di-approve) -> otomatis jadi TARGET PROMOSI.
+// Nama grup BEBAS / acak, gak perlu kata kunci. Satu-satunya yang perlu
+// ditandai manual: GB TESTIMONI via /settesti di grup itu.
+bot.on('my_chat_member', async (ctx) => {
+  try {
+    const upd = ctx.myChatMember;
+    const st = upd?.new_chat_member?.status;
+    const chat = upd?.chat;
+    if (!chat || chat.type === 'private') return;
+    const id = String(chat.id);
+    let g = {};
+    try { g = await readJson(groupsFile); } catch {}
+    if (!Array.isArray(g.promoGroups)) g.promoGroups = [];
+    // Bot dikick / dibanned -> cabut dari daftar
+    if (['left', 'kicked', 'banned'].includes(st)) {
+      g.promoGroups = g.promoGroups.filter((x) => String(x) !== id);
+      await writeJson(groupsFile, g).catch(() => {});
+      return;
+    }
+    if (!['member', 'administrator'].includes(st)) return;
+    const testi = String(config.testiGroupId || g.testiGroupId || '');
+    if (id === testi) return; // grup testimoni bukan target promosi
+    if (!g.promoGroups.map(String).includes(id)) {
+      g.promoGroups.push(id);
+      await writeJson(groupsFile, g);
+      await ctx.reply(`✅ Halo! Grup ini otomatis jadi TARGET PROMOSI.\n/broadcast dari chat admin bakal terkirim ke sini.\n⚠️ Jangan jadikan grup testimoni — kalau ini grup testimoni, admin ketik /settesti.`).catch(() => {});
+      await notifyAdmins(`✅ Auto-promosi: "${chat.title}" (${id}) ditambah. Total target: ${g.promoGroups.length}.`);
+    }
+  } catch {}
 });
 
 // Format: /tambahsaldo <id_telegram> <nominal>  (contoh: /tambahsaldo 123456 10000)
