@@ -27,7 +27,7 @@ if (!String(process.env.BOT_TOKEN).includes(':')) {
 }
 
 const PRICE = Number(process.env.PRICE || 1000);
-const UNIT_PRICE = Math.round(PRICE / 2);
+const UNIT_PRICE = Number(process.env.PRICE || 1000); // 1 VPS = 1k, tanpa minimal
 
 const config = {
   qrisToken: process.env.QRIS_TOKEN,
@@ -299,13 +299,13 @@ async function afterBuySuccess(order, vps) {
   try {
     const left = await getStockCount();
     await notifyAdmins(
-      `🛒 Penjualan!\n👤 ${order.buyerName || 'User'} (${order.chatId})\n📦 2x VPS NAT via ${order.payMethod === 'balance' ? 'SALDO' : 'QRIS'} ${formatRupiah(order.total || PRICE)}\n🌐 ${vps.map((v) => `${v.ip}:${v.port}`).join(', ')}\n📊 Sisa stok: ${left}\nRef: ${order.reference || String(order.id).slice(0, 8)}`
+      `🛒 Penjualan!\n👤 ${order.buyerName || 'User'} (${order.chatId})\n📦 1x VPS NAT via ${order.payMethod === 'balance' ? 'SALDO' : 'QRIS'} ${formatRupiah(order.total || PRICE)}\n🌐 ${vps.map((v) => `${v.ip}:${v.port}`).join(', ')}\n📊 Sisa stok: ${left}\nRef: ${order.reference || String(order.id).slice(0, 8)}`
     );
   } catch {}
   try {
     await sendTesti('buy', {
       name: order.buyerName || 'Pembeli',
-      detail: '2x VPS NAT',
+      detail: '1x VPS NAT',
       amount: formatRupiah(order.total || PRICE),
       ref: order.reference || order.id,
     });
@@ -350,8 +350,8 @@ async function deliver(orderId) {
   if (!order || order.status === 'delivered') return false;
   const stock = await readJson(stockFile);
   if (!Array.isArray(stock)) throw new Error('Format data/vps_stock.json harus array.');
-  if (stock.length < 2) throw new Error('Stok VPS kurang dari 2.');
-  const vps = stock.splice(0, 2);
+  if (stock.length < 1) throw new Error('Stok VPS habis.');
+  const vps = stock.splice(0, 1);
   await writeJson(stockFile, stock);
   order.status = 'delivered';
   order.deliveredAt = Date.now();
@@ -359,7 +359,7 @@ async function deliver(orderId) {
   await writeJson(ordersFile, orders);
   await bot.telegram.sendMessage(
     order.chatId,
-    `VPS Berhasil Dibuat\n───────────◆───────────\n\n${vpsMessage(vps[0], 1)}\n\n───────────◆───────────\n\n${vpsMessage(vps[1], 2)}\n\nSimpan baik-baik. Jangan share ke orang lain.`
+    `VPS Berhasil Dibuat\n───────────◆───────────\n\n${vpsMessage(vps[0], 1)}\n\nSimpan baik-baik. Jangan share ke orang lain.`
   );
   await afterBuySuccess(order, vps);
   return true;
@@ -568,38 +568,38 @@ async function buildStart(name, chatId) {
   const balance = chatId ? await getBalance(chatId) : 0;
   const total = config.stockTotal > 0 ? config.stockTotal : Math.max(remaining, 1);
   const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
-  const empty = remaining < 2;
+  const empty = remaining < 1;
+  const dot = empty ? '🔴' : percent < 30 ? '🟡' : '🟢';
   const text =
-    `ᴀᴜᴛᴏ ᴏʀᴅᴇʀ VPS NAT • ᴄᴇᴘᴀᴛ & ᴛᴇʀᴘᴇʀᴄᴀʏᴀ\n` +
-    `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n\n` +
-    `👋 ʜᴀʟᴏ, ${name}!\n` +
-    `sᴇʟᴀᴍᴀᴛ ᴅᴀᴛᴀɴɢ ᴅɪ ʙᴏᴛ ᴀᴜᴛᴏ ᴏʀᴅᴇʀ ᴋᴀᴍɪ 🚀\n\n` +
-    `💰 sᴀʟᴅᴏ ᴀɴᴅᴀ: ${formatRupiah(balance)}\n\n` +
-    `📦 ɪɴꜰᴏ ᴘʀᴏᴅᴜᴋ\n` +
-    `├ ᴘʀᴏᴅᴜᴋ : VPS NAT\n` +
-    `├ ʜᴀʀɢᴀ : ${formatRupiah(UNIT_PRICE)} / ᴜɴɪᴛ\n` +
-    `├ ᴍɪɴɪᴍᴀʟ : 2 ᴜɴɪᴛ\n` +
-    `└ sᴘᴇsɪꜰɪᴋᴀsɪ : ${config.productSpec}\n\n` +
-    `📊 sᴛᴏᴋ ᴛᴇʀsᴇᴅɪᴀ\n` +
-    `├ ${stockBar(percent)} ${percent}%\n` +
-    `└ sɪsᴀ : ${remaining} / ${total} ᴜɴɪᴛ\n` +
-    (empty ? `\n❌ sᴛᴏᴋ ʜᴀʙɪs — ᴄᴏʙᴀ ʟᴀɢɪ ɴᴀɴᴛɪ.\n` : ``) +
-    `\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `⚡️ ᴘʀᴏsᴇs ᴏᴛᴏᴍᴀᴛɪs sᴇᴛᴇʟᴀʜ ᴘᴇᴍʙᴀʏᴀʀᴀɴ\n` +
-    `🔒 ᴀᴍᴀɴ, ᴄᴇᴘᴀᴛ & ᴛᴇʀᴘᴇʀᴄᴀʏᴀ\n\n` +
-    `👇 ᴋʟɪᴋ ᴛᴏᴍʙᴏʟ ᴅɪ ʙᴀᴡᴀʜ ʙᴜᴀᴛ ᴍᴜʟᴀɪ ᴏʀᴅᴇʀ!`;
-  const buttons = empty
-    ? Markup.inlineKeyboard([[Markup.button.callback('🔄 Cek Stok', 'cek_stok')]])
-    : Markup.inlineKeyboard([
-        [Markup.button.callback(`🛒 Beli 2 VPS — ${formatRupiah(PRICE)} (QRIS)`, 'buy')],
+    `✦ ${config.shopName} ✦\n` +
+    `VPS NAT Premium — Cepat, Stabil, Terpercaya\n` +
+    `━━━━━━━━━━━━━━━━━━\n\n` +
+    `Halo, ${name}! 👋\n` +
+    `Selamat datang di layanan auto-order kami.\n\n` +
+    `💰 Saldo Anda : ${formatRupiah(balance)}\n\n` +
+    `📦 Produk : VPS NAT\n` +
+    `└ Harga : ${formatRupiah(UNIT_PRICE)} / unit\n` +
+    `└ Spesifikasi : ${config.productSpec}\n\n` +
+    `📊 Stok : ${dot} ${remaining}/${total} unit (${percent}%)\n` +
+    `${stockBar(percent)}\n` +
+    (empty ? `\n❌ Stok sedang habis — coba lagi nanti.\n` : ``) +
+    `\n━━━━━━━━━━━━━━━━━━\n` +
+    `⚡ Proses otomatis setelah pembayaran\n` +
+    `🔒 Aman & terpercaya — bukti order di channel testimoni`;
+  const rows = empty
+    ? [[Markup.button.callback('🔄 Cek Stok', 'cek_stok')]]
+    : [
+        [Markup.button.callback(`🛒 Beli 1 VPS • ${formatRupiah(PRICE)} (QRIS)`, 'buy')],
         [Markup.button.callback('💰 Beli pakai Saldo', 'buy_balance'), Markup.button.callback('➕ Top Up', 'topup')],
-      ]);
-  return { text, buttons };
+      ];
+  rows.push([Markup.button.url('⭐ Testimoni', 'https://t.me/testimonialnat')]);
+  return { text, buttons: Markup.inlineKeyboard(rows) };
 }
 
 bot.start(async (ctx) => {
   const name = ctx.from?.first_name || 'kak';
-  const { text, buttons } = await buildStart(name, getChatId(ctx));
+  const chatId = getChatId(ctx);
+  const { text, buttons } = await buildStart(name, chatId);
   await ctx.reply(text, buttons);
 });
 
@@ -618,10 +618,10 @@ bot.command('saldo', async (ctx) => {
   const chatId = getChatId(ctx);
   const balance = await getBalance(chatId);
   await ctx.reply(
-    `💰 Saldo kamu: ${formatRupiah(balance)}\n\nTop up dulu sebelum beli pakai saldo. 1 order (2 VPS) = ${formatRupiah(PRICE)}.`,
+    `💰 Saldo kamu: ${formatRupiah(balance)}\n\nTop up dulu sebelum beli pakai saldo. 1 VPS = ${formatRupiah(PRICE)}.`,
     Markup.inlineKeyboard([
       [Markup.button.callback('➕ Top Up Saldo', 'topup')],
-      [Markup.button.callback(`💰 Beli 2 VPS — ${formatRupiah(PRICE)}`, 'buy_balance')],
+      [Markup.button.callback(`💰 Beli 1 VPS — ${formatRupiah(PRICE)}`, 'buy_balance')],
     ])
   );
 });
@@ -669,7 +669,7 @@ function qrisExpiryText(qris) {
 bot.action('buy', async (ctx) => {
   try {
     const stock = await readJson(stockFile);
-    if (!Array.isArray(stock) || stock.length < 2) return ctx.answerCbQuery('Stok habis.');
+    if (!Array.isArray(stock) || stock.length < 1) return ctx.answerCbQuery('Stok habis.');
   } catch (e) {
     return ctx.answerCbQuery('Stok belum siap.');
   }
@@ -761,12 +761,12 @@ bot.action('buy_balance', async (ctx) => {
   const buyerName = ctx.from?.first_name || '';
   const result = await withStockLock(async () => {
     const stock = await readJson(stockFile);
-    if (!Array.isArray(stock) || stock.length < 2) return { ok: false, reason: 'habis' };
+    if (!Array.isArray(stock) || stock.length < 1) return { ok: false, reason: 'habis' };
     const users = await readJson(usersFile);
     const bal = Number(users?.[chatId]?.balance || 0);
     if (bal < PRICE) return { ok: false, reason: 'saldo', bal };
     users[chatId] = { ...(users[chatId] || {}), balance: bal - PRICE, name: buyerName || users[chatId]?.name };
-    const vps = stock.splice(0, 2);
+    const vps = stock.splice(0, 1);
     const orders = await readJson(ordersFile);
     const order = {
       id: randomUUID(),
@@ -799,7 +799,7 @@ bot.action('buy_balance', async (ctx) => {
   try {
     await ctx.telegram.sendMessage(
       chatId,
-      `VPS Berhasil Dibuat (Saldo)\n───────────◆───────────\n\n${vpsMessage(result.vps[0], 1)}\n\n───────────◆───────────\n\n${vpsMessage(result.vps[1], 2)}\n\nSimpan baik-baik. Jangan share ke orang lain.`
+      `VPS Berhasil Dibuat (Saldo)\n───────────◆───────────\n\n${vpsMessage(result.vps[0], 1)}\n\nSimpan baik-baik. Jangan share ke orang lain.`
     );
   } catch {}
   await afterBuySuccess(result.order, result.vps);
