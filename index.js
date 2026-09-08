@@ -801,6 +801,7 @@ async function buildStart(name, chatId) {
   const t0 = Date.now();
   const remaining = await getStockCount();
   const balance = chatId ? await getBalance(chatId) : 0;
+  const otpBal = chatId ? await getOtpBalance(chatId) : 0;
   let ping = null;
   try {
     await bot.telegram.getMe();
