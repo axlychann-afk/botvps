@@ -2279,5 +2279,55 @@ bot.launch()
 
 bot.catch((err) => console.error('Bot error:', err?.message || err));
 
+// ---- Auto-backup per jam ke DM admin (fitur, tanpa cron/PC) ----
+// Kirim 9 file satuan tiap BACKUP_HOURS jam. Hidup selama bot jalan.
+const BACKUP_FILES = [
+  'index.js',
+  'lib/rumahotp.js',
+  'package.json',
+  '.env.example',
+  'data/users.json',
+  'data/orders.json',
+  'data/vps_stock.json',
+  'data/group_config.json',
+  '.env',
+];
+const backupHours = Number(process.env.BACKUP_HOURS || 1);
+// Grup backup (ID GC, bot harus jadi member). Kosong = DM admin pertama.
+const backupTarget = process.env.BACKUP_GROUP_ID || process.env.BACKUP_ADMIN_ID || config.adminIds[0] || '';
+
+async function sendBackup(manual = false) {
+  if (!backupTarget) {
+    if (manual) console.error('Backup: BACKUP_GROUP_ID / ADMIN_IDS kosong.');
+    return false;
+  }
+  let ok = 0;
+  for (const f of BACKUP_FILES) {
+    try {
+      const buf = await readFile(path.join(__dirname, f));
+      await bot.telegram.sendDocument(backupTarget, { source: buf, filename: f.replaceAll('/', '_') }, { caption: `💾 ${f}` });
+      ok++;
+      await new Promise((s) => setTimeout(s, 2000));
+    } catch (e) {
+      console.error(`Backup gagal ${f}:`, e.message);
+    }
+  }
+  console.log(`Backup ${manual ? 'manual' : 'otomatis'}: ${ok}/${BACKUP_FILES.length} file ke ${backupTarget}`);
+  return ok > 0;
+}
+
+bot.command('backup', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  await ctx.reply('💾 Backup manual jalan, tunggu file masuk DM...');
+  await sendBackup(true);
+});
+
+if (backupHours > 0 && backupTarget) {
+  const ms = backupHours * 3600_000;
+  const t = setInterval(() => { sendBackup(false).catch(() => {}); }, ms);
+  if (typeof t.unref === 'function') t.unref();
+  console.log(`Auto-backup tiap ${backupHours} jam ke ${backupTarget}`);
+}
+
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
