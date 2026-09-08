@@ -778,7 +778,7 @@ async function resumePolling() {
 }
 
 function formatRupiah(n) {
-  return `Rp${Number(n || PRICE).toLocaleString('id-ID')}`;
+  return `Rp${Number(n ?? PRICE).toLocaleString('id-ID')}`;
 }
 
 async function getStockCount() {
