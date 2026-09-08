@@ -246,6 +246,30 @@ function joinGateButtons() {
   return Markup.inlineKeyboard(rows);
 }
 
+// ---- Daftar GB promosi: [{id, title}], + blocked: [id] ----
+// Normalisasi: dukung format lama (array string) biar gak rusak pas update.
+function normGroups(g) {
+  const out = [];
+  const raw = Array.isArray(g?.promoGroups) ? g.promoGroups : [];
+  for (const e of raw) {
+    if (typeof e === 'string') out.push({ id: String(e), title: '' });
+    else if (e && e.id) out.push({ id: String(e.id), title: String(e.title || '') });
+  }
+  if (g?.promoGroupId) out.push({ id: String(g.promoGroupId), title: '' });
+  if (config.promoGroupId) out.push({ id: String(config.promoGroupId), title: '' });
+  const seen = new Set(), res = [];
+  for (const e of out) {
+    if (!e.id || seen.has(e.id)) continue;
+    seen.add(e.id);
+    res.push(e);
+  }
+  return res;
+}
+function normBlocked(g) {
+  const raw = Array.isArray(g?.blockedGroups) ? g.blockedGroups : [];
+  return [...new Set(raw.map(String))];
+}
+
 async function sendToPromo(ctx, text, extra = {}) {
   const { list } = await getPromoTargets();
   if (!list.length) {
@@ -253,12 +277,12 @@ async function sendToPromo(ctx, text, extra = {}) {
     return false;
   }
   let ok = 0;
-  for (const target of list) {
+  for (const t of list) {
     try {
-      await bot.telegram.sendMessage(target, text, extra);
+      await bot.telegram.sendMessage(t.id, text, extra);
       ok++;
     } catch (e) {
-      console.error(`Gagal kirim promosi ke ${target}:`, e.message);
+      console.error(`Gagal kirim promosi ke ${t.id}:`, e.message);
     }
   }
   if (!ok) {
@@ -273,23 +297,21 @@ async function getPromoId() {
   if (config.promoGroupId) return config.promoGroupId;
   try {
     const g = await readJson(groupsFile);
-    if (Array.isArray(g?.promoGroups) && g.promoGroups.length) return g.promoGroups[0];
+    const list = normGroups(g);
+    if (list.length) return list[0].id;
     return g?.promoGroupId || '';
   } catch { return ''; }
 }
-// Semua target broadcast: semua grup yang dikenal KECUALI grup testimoni.
+// Semua target broadcast: semua grup yang dikenal KECUALI grup testimoni + yang di-block.
 // Jadi GB apapun yang bot dimasukin otomatis jadi target promosi.
 async function getPromoTargets() {
   try {
     const g = await readJson(groupsFile);
     const testi = String(config.testiGroupId || '');
-    let list = [];
-    if (Array.isArray(g?.promoGroups)) list = [...g.promoGroups];
-    if (g?.promoGroupId) list.push(String(g.promoGroupId));
-    if (config.promoGroupId) list.push(String(config.promoGroupId));
-    list = [...new Set(list.map(String))].filter((id) => id && id !== String(testi));
-    return { list, testi: String(testi) };
-  } catch { return { list: config.promoGroupId ? [String(config.promoGroupId)] : [], testi: '' }; }
+    const blocked = new Set(normBlocked(g));
+    const list = normGroups(g).filter((e) => e.id !== testi && !blocked.has(e.id));
+    return { list, testi };
+  } catch { return { list: config.promoGroupId ? [{ id: String(config.promoGroupId), title: '' }] : [], testi: '' }; }
 }
 async function getTestiId() {
   return config.testiGroupId || '';
@@ -1166,18 +1188,30 @@ bot.action('cek_join', async (ctx) => {
 });
 
 // ---- Perintah admin ----
-// /admin — panel khusus admin
+// /admin — panel + daftar semua command admin
 bot.command('admin', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const { list } = await getPromoTargets();
   const tg = await getTestiId();
+  let blocked = 0;
+  try { blocked = normBlocked(await readJson(groupsFile)).length; } catch {}
   await ctx.reply(
     `🛠 Panel Admin — ${config.shopName}\n` +
-    `GB Promosi: ${list.length} grup (otomatis)\n` +
-    `GB Testimoni: ${tg || '(belum diset di .env)'}\n\n` +
-    `Pilih aksi:`,
+    `📢 Target promosi: ${list.length} GB${blocked ? ` (${blocked} di-block)` : ''}\n` +
+    `⭐ Testimoni: ${tg || '(belum diset di .env)'}\n\n` +
+    `📋 Command admin:\n` +
+    `/broadcast <teks> — kirim promosi ke semua GB\n` +
+    `/bclist — lihat daftar GB + nomor\n` +
+    `/bcblock <nomor> — block GB biar gak kena broadcast\n` +
+    `/bcunblock <nomor> — buka block\n` +
+    `/stok — cek stok\n` +
+    `/tambahstok — tambah stok\n` +
+    `/tambahsaldo <id> <nominal> — tambah saldo user\n` +
+    `/riwayat [n] — order terakhir\n\n` +
+    `Pilih aksi cepat:`,
     Markup.inlineKeyboard([
-      [Markup.button.callback('📢 Broadcast Teks ke GB Promosi', 'bc_help')],
+      [Markup.button.callback('📢 Cara Broadcast', 'bc_help')],
+      [Markup.button.callback('📋 Daftar GB', 'adm_bclist')],
       [Markup.button.callback('📊 Cek Stok', 'adm_stok'), Markup.button.callback('🧾 Riwayat', 'adm_riwayat')],
     ])
   );
@@ -1208,6 +1242,101 @@ bot.action('adm_riwayat', async (ctx) => {
   await ctx.reply(`🧾 5 order terakhir:\n` + list.map((o) => `• ${o.buyerName || o.chatId} — ${o.status} — ${formatRupiah(o.kind === 'topup' ? o.amount : o.total)}`).join('\n'));
 });
 
+bot.action('adm_bclist', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  await sendBcList(ctx);
+});
+
+async function sendBcList(ctx) {
+  let g = {};
+  try { g = await readJson(groupsFile); } catch {}
+  const all = normGroups(g);
+  const blocked = new Set(normBlocked(g));
+  const testi = String(config.testiGroupId || '');
+  if (!all.length) {
+    await ctx.reply('📋 Belum ada GB. Add bot ke grup, otomatis masuk daftar.');
+    return;
+  }
+  for (const e of all) {
+    if (!e.title) {
+      try {
+        const c = await bot.telegram.getChat(e.id);
+        e.title = c?.title || e.id;
+      } catch { e.title = e.id; }
+    }
+  }
+  try {
+    g.promoGroups = all;
+    await writeJson(groupsFile, g);
+  } catch {}
+  const lines = all.map((e, i) => {
+    const tags = [];
+    if (e.id === testi) tags.push('⭐testi-skip');
+    if (blocked.has(e.id)) tags.push('⛔blocked');
+    return `${i + 1}. ${e.title || e.id}${tags.length ? ` [${tags.join(', ')}]` : ''}`;
+  });
+  await ctx.reply(
+    `📋 Daftar GB Broadcast (${all.length}):\n\n${lines.join('\n')}\n\n` +
+    `Block: /bcblock <nomor> (cth: /bcblock 2)\nBuka: /bcunblock <nomor>\nTestimoni otomatis di-skip.`
+  );
+}
+
+// /bclist — lihat semua GB + nomor
+bot.command('bclist', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  await sendBcList(ctx);
+});
+
+// /bcblock <nomor> — block GB biar gak kena broadcast. Bisa banyak: /bcblock 1 3
+bot.command('bcblock', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const args = (ctx.message?.text || '').replace(/^\/bcblock(@\w+)?/, '').trim().split(/\s+/).filter(Boolean);
+  if (!args.length) {
+    await ctx.reply('Format: /bcblock <nomor>\nContoh: /bcblock 2\nLihat nomor di /bclist.');
+    return;
+  }
+  let g = {};
+  try { g = await readJson(groupsFile); } catch {}
+  const all = normGroups(g);
+  const blocked = new Set(normBlocked(g));
+  const added = [];
+  for (const a of args) {
+    const n = Number(a);
+    if (!Number.isFinite(n) || n < 1 || n > all.length) continue;
+    blocked.add(all[n - 1].id);
+    added.push(`${n}. ${all[n - 1].title || all[n - 1].id}`);
+  }
+  g.blockedGroups = [...blocked];
+  await writeJson(groupsFile, g);
+  if (!added.length) { await ctx.reply('Nomor tidak valid. Cek /bclist.'); return; }
+  await ctx.reply(`⛔ Di-block (${added.length}):\n${added.join('\n')}\n\nGB ini gak bakal kena /broadcast lagi.`);
+});
+
+// /bcunblock <nomor> — buka block
+bot.command('bcunblock', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const args = (ctx.message?.text || '').replace(/^\/bcunblock(@\w+)?/, '').trim().split(/\s+/).filter(Boolean);
+  if (!args.length) {
+    await ctx.reply('Format: /bcunblock <nomor>\nContoh: /bcunblock 2');
+    return;
+  }
+  let g = {};
+  try { g = await readJson(groupsFile); } catch {}
+  const all = normGroups(g);
+  const blocked = new Set(normBlocked(g));
+  const opened = [];
+  for (const a of args) {
+    const n = Number(a);
+    if (!Number.isFinite(n) || n < 1 || n > all.length) continue;
+    blocked.delete(all[n - 1].id);
+    opened.push(`${n}. ${all[n - 1].title || all[n - 1].id}`);
+  }
+  g.blockedGroups = [...blocked];
+  await writeJson(groupsFile, g);
+  if (!opened.length) { await ctx.reply('Nomor tidak valid. Cek /bclist.'); return; }
+  await ctx.reply(`✅ Dibuka (${opened.length}):\n${opened.join('\n')}\n\nGB ini kena /broadcast lagi.`);
+});
+
 // /broadcast <teks> — khusus admin, kirim ke SEMUA GB promosi (otomatis).
 // Kalau dipakai sambil reply foto/video/dokumen, media ikut diteruskan + caption.
 bot.command('broadcast', async (ctx) => {
@@ -1226,20 +1355,20 @@ bot.command('broadcast', async (ctx) => {
     if (reply && (reply.photo || reply.video || reply.document || reply.animation)) {
       const cap = text || reply.caption || '';
       let ok = 0;
-      for (const target of list) {
+      for (const t of list) {
         try {
           if (reply.photo) {
             const fid = reply.photo[reply.photo.length - 1].file_id;
-            await bot.telegram.sendPhoto(target, fid, { caption: cap.slice(0, 1000) });
+            await bot.telegram.sendPhoto(t.id, fid, { caption: cap.slice(0, 1000) });
           } else if (reply.video) {
-            await bot.telegram.sendVideo(target, reply.video.file_id, { caption: cap.slice(0, 1000) });
+            await bot.telegram.sendVideo(t.id, reply.video.file_id, { caption: cap.slice(0, 1000) });
           } else if (reply.animation) {
-            await bot.telegram.sendAnimation(target, reply.animation.file_id, { caption: cap.slice(0, 1000) });
+            await bot.telegram.sendAnimation(t.id, reply.animation.file_id, { caption: cap.slice(0, 1000) });
           } else if (reply.document) {
-            await bot.telegram.sendDocument(target, reply.document.file_id, { caption: cap.slice(0, 1000) });
+            await bot.telegram.sendDocument(t.id, reply.document.file_id, { caption: cap.slice(0, 1000) });
           }
           ok++;
-        } catch (e) { console.error(`Gagal broadcast media ke ${target}:`, e.message); }
+        } catch (e) { console.error(`Gagal broadcast media ke ${t.id}:`, e.message); }
       }
       await ctx.reply(ok ? `✅ Broadcast media terkirim ke ${ok} GB.` : '❌ Gagal kirim ke semua GB.');
       return;
@@ -1313,7 +1442,8 @@ bot.command('riwayat', async (ctx) => {
 });
 
 // Bot baru masuk grup (di-add / di-approve) -> diam-diam jadi TARGET PROMOSI.
-// Tanpa sapaan, tanpa command. Testimoni murni dari TESTI_GROUP_ID di .env.
+// Tanpa sapaan di grup. Notif cuma ke admin via DM bot.
+// Testimoni murni dari TESTI_GROUP_ID di .env.
 bot.on('my_chat_member', async (ctx) => {
   try {
     const upd = ctx.myChatMember;
@@ -1321,20 +1451,28 @@ bot.on('my_chat_member', async (ctx) => {
     const chat = upd?.chat;
     if (!chat || chat.type === 'private') return;
     const id = String(chat.id);
+    const title = String(chat.title || 'Grup');
     let g = {};
     try { g = await readJson(groupsFile); } catch {}
-    if (!Array.isArray(g.promoGroups)) g.promoGroups = [];
+    let list = normGroups(g);
     if (['left', 'kicked', 'banned'].includes(st)) {
-      g.promoGroups = g.promoGroups.filter((x) => String(x) !== id);
+      list = list.filter((x) => x.id !== id);
+      g.promoGroups = list;
       await writeJson(groupsFile, g).catch(() => {});
+      await notifyAdmins(`➖ Bot keluar/dikeluarkan dari "${title}" (${id}).\n📢 Sisa target: ${list.length} GB.`);
       return;
     }
     if (!['member', 'administrator'].includes(st)) return;
     const testi = String(config.testiGroupId || '');
-    if (id === testi) return; // grup testimoni bukan target promosi
-    if (!g.promoGroups.map(String).includes(id)) {
-      g.promoGroups.push(id);
+    if (id === testi) {
+      await notifyAdmins(`⭐ Bot ada di GB TESTIMONI "${title}" (${id}).\nDikecualikan dari broadcast, dipakai testimoni + gate join.`);
+      return;
+    }
+    if (!list.some((x) => x.id === id)) {
+      list.push({ id, title });
+      g.promoGroups = list;
       await writeJson(groupsFile, g).catch(() => {});
+      await notifyAdmins(`➕ Bot masuk GB baru: "${title}" (${id}).\n📢 Otomatis jadi target broadcast. Total: ${list.length} GB.\nKetik /bclist buat lihat daftar.`);
     }
   } catch {}
 });
