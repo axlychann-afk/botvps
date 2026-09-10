@@ -790,6 +790,43 @@ function stopPolling(orderId) {
   }
 }
 
+// Anti QR ganda: 1 chat cuma boleh punya 1 pembayaran pending.
+// Tap ke-2 (double-tap / spam tombol) ditolak + disuruh bayar/batalkan QR yg ada.
+// withPayLock bikin sekuens per chat biar 2 tap barengan ga lolos bareng.
+const payQueue = new Map();
+function withPayLock(chatId, fn) {
+  const key = String(chatId ?? '');
+  const prev = payQueue.get(key) || Promise.resolve();
+  const next = prev.catch(() => {}).then(fn);
+  const tail = next.catch(() => {});
+  payQueue.set(key, tail);
+  tail.finally(() => { if (payQueue.get(key) === tail) payQueue.delete(key); });
+  return next;
+}
+
+async function findPendingPayment(chatId) {
+  try {
+    const orders = await readJson(ordersFile);
+    for (const o of Object.values(orders)) {
+      if (!o || o.chatId !== chatId || o.status !== 'pending' || !o.reference) continue;
+      if (!['buy', 'topup', 'nokos_pending', 'otp_topup'].includes(o.kind || 'buy')) continue;
+      if (isExpired(o)) continue;
+      return o;
+    }
+  } catch {}
+  return null;
+}
+
+async function refuseIfPending(ctx, chatId) {
+  const dup = await findPendingPayment(chatId);
+  if (!dup) return false;
+  await ctx.answerCbQuery('Kamu masih punya QR aktif.').catch(() => {});
+  await ctx.reply(
+    `⚠️ Bayar QR yang tadi dulu (ref: ${dup.reference}) atau batalkan sebelum bikin baru.`
+  ).catch(() => {});
+  return true;
+}
+
 // Pengecekan otomatis tanpa ctx (dipakai polling): dukung order beli & deposit.
 async function autoCheck(orderId) {
   const orders = await readJson(ordersFile);
@@ -1126,6 +1163,7 @@ function qrisExpiryText(qris) {
 }
 
 bot.action('buy', async (ctx) => {
+  await withPayLock(getChatId(ctx), async () => {
   try {
     if (!(await isJoinedTesti(ctx.from.id))) {
       await ctx.answerCbQuery('Gabung GB Testimoni dulu!');
@@ -1138,6 +1176,7 @@ bot.action('buy', async (ctx) => {
     return ctx.answerCbQuery('Stok belum siap.');
   }
   try {
+    if (await refuseIfPending(ctx, getChatId(ctx))) return;
     const qris = await createQris(PRICE);
     const chatId = getChatId(ctx);
     const order = {
@@ -1167,6 +1206,7 @@ bot.action('buy', async (ctx) => {
     await ctx.answerCbQuery('Gagal membuat QRIS.');
     await ctx.reply(`Gagal: ${error.message}`);
   }
+  });
 });
 
 // ---- Deposit / Top Up Saldo ----
@@ -1226,8 +1266,10 @@ bot.action('topup_otp', async (ctx) => {
 
 bot.action(/^topupotp:(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
+  await withPayLock(getChatId(ctx), async () => {
   const nominal = Number(ctx.match[1]);
   if (!OTP_TOPUP_OPTIONS.includes(nominal)) return ctx.answerCbQuery('Nominal tidak valid.');
+  if (await refuseIfPending(ctx, getChatId(ctx))) return;
   let dep = null;
   try { dep = await createDeposit(nominal, 'qris'); }
   catch (e) { await ctx.reply(`Gagal bikin QRIS: ${e.message}`); return; }
@@ -1251,6 +1293,7 @@ bot.action(/^topupotp:(\d+)$/, async (ctx) => {
   const qris = { image: dep.qr_image, reference: dep.id };
   await sendQrisPhoto(ctx, qris, order,
     `📱 Top up Saldo OTP ${formatRupiah(dep.diterima || nominal)} lewat QR ini.\nBayar ${formatRupiah(dep.total)} (termasuk fee).\n\nDeposit: ${dep.id}\n${qrisExpiryText({ expiredAt: dep.expired_at })}`);
+  });
 });
 
 // Kredit saldo OTP yang sudah dibayar via QRIS.
@@ -1290,9 +1333,11 @@ async function checkDeposit(order) {
 }
 
 bot.action(/^topup:(\d+)$/, async (ctx) => {
+  await withPayLock(getChatId(ctx), async () => {
   const nominal = Number(ctx.match[1]);
   if (!TOPUP_OPTIONS.includes(nominal)) return ctx.answerCbQuery('Nominal tidak valid.');
   try {
+    if (await refuseIfPending(ctx, getChatId(ctx))) return;
     const qris = await createQris(nominal);
     const chatId = getChatId(ctx);
     const order = {
@@ -1323,6 +1368,7 @@ bot.action(/^topup:(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery('Gagal membuat QRIS.');
     await ctx.reply(`Gagal: ${error.message}`);
   }
+  });
 });
 
 // ---- Beli pakai saldo ----
@@ -1716,6 +1762,7 @@ bot.action(/^nbuy:(\d+)(?::(\d+):([^:]+))?$/, async (ctx) => {
     await ctx.reply(`❌ Kamu sudah pegang max ${config.nokosMaxActive} nokos aktif. Selesaikan/batalkan dulu.`);
     return;
   }
+  await withPayLock(getChatId(ctx), async () => {
   const args = parseBuyArgs(ctx.match);
   let meta = null;
   try { meta = await prepareNokosMeta(args.serviceId, args.numberId, args.providerId); }
@@ -1727,6 +1774,7 @@ bot.action(/^nbuy:(\d+)(?::(\d+):([^:]+))?$/, async (ctx) => {
     return;
   }
   let qris = null;
+  if (await refuseIfPending(ctx, getChatId(ctx))) return;
   try { qris = await createQris(meta.jual); }
   catch (e) { await ctx.reply(`Gagal bikin QRIS: ${e.message}`); return; }
   const chatId = getChatId(ctx);
@@ -1746,6 +1794,7 @@ bot.action(/^nbuy:(\d+)(?::(\d+):([^:]+))?$/, async (ctx) => {
   startPolling(order.id);
   await sendQrisPhoto(ctx, qris, order,
     `📱 Nokos ${meta.label} ${meta.row.name} — bayar ${formatRupiah(qris.total)} lewat QR ini.\nNomor diorder OTOMATIS setelah bayar.\n\nReference: ${qris.reference}\n${qrisExpiryText(qris)}`);
+  });
 });
 
 bot.action(/^nbuybal:(\d+)(?::(\d+):([^:]+))?$/, async (ctx) => {
