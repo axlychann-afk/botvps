@@ -49,11 +49,12 @@ const UNIT_PRICE = Number(process.env.PRICE || 1000); // 1 VPS = 1k, tanpa minim
 
 const config = {
   qrisToken: process.env.QRIS_TOKEN,
-  // XentraPay: semua endpoint GET pakai ?apikey=... (lihat https://app.xentrapay.xyz/docs)
-  // QRIS_TOKEN di .env sekarang = XentraPay apikey (mgcloudpay_...).
-  topupUrl: process.env.QRIS_TOPUP_URL || 'https://app.xentrapay.xyz/api/invoice',
-  statusUrl: process.env.QRIS_STATUS_URL || 'https://app.xentrapay.xyz/api/invoice/status',
-  cancelUrl: process.env.QRIS_CANCEL_URL || '', // XentraPay tak ada cancel API -> batal lokal saja
+  // Payment QRIS: auth ?apikey=... + IP whitelist di dashboard.
+  // QRIS_TOKEN di .env = apikey payment (apg_live_...).
+  // Endpoin bawaan di bawah; override via .env bila perlu.
+  topupUrl: process.env.QRIS_TOPUP_URL || 'https://austinstore.id/api/deposit/create',
+  statusUrl: process.env.QRIS_STATUS_URL || 'https://austinstore.id/api/deposit',
+  cancelUrl: process.env.QRIS_CANCEL_URL || 'https://austinstore.id/api/deposit/cancel',
   pollSeconds: Number(process.env.PAYMENT_POLL_SECONDS || 15),
   timeoutMinutes: Number(process.env.PAYMENT_TIMEOUT_MINUTES || 10),
   // Total kapasitas stok untuk bar persen. Isi mis. 102. Kalau 0/kosong, total = sisa saat ini.
@@ -124,32 +125,54 @@ function withStockLock(fn) {
   return next;
 }
 
-// ---- Helpers QRIS (XentraPay — verified live 2026-09-08) ----
-// Create:  GET /api/invoice?apikey=KEY&amount=N
-//   -> { success:true, invoice_id, amount, fee, total, qris_image, payment_link, expired_at }
-// Status:  GET /api/invoice/status?apikey=KEY&invoice_id=ID
-//   -> { invoice_id, amount, fee, total, status:"pending"|"paid"|..., qris_image, ... }
-// Cancel:  tak ada endpoint cancel di XentraPay -> batal lokal (stop polling, tandai cancelled).
-//   Invoice yang tak dibayar expired sendiri (±15 mnt, lihat expired_at).
+// ---- Helpers QRIS (payment) ----
+// Create:  POST {topupUrl}?apikey=KEY  body { amount }
+//   -> { success:true, deposit:{ id, transaction_id, amount, unique_code, fee,
+//        qr_string, qr_image, expired_at, status } }
+//   `amount` respons SUDAH termasuk fee + unique_code -> user bayar pas segitu.
+// Check:   GET {base}/api/deposit/check/:transactionId?apikey=KEY
+//   -> { success:true, status:"pending"|"paid"|"expired" }
+// Cancel:  POST {base}/api/deposit/cancel/:transactionId?apikey=KEY
+//   -> { success:true, status:"cancel" } (paid/expired tak bisa dibatalkan)
+// Rate limit create: 5 req/menit per key. Poll check minimal tiap 5 detik.
+
+function paymentDeposit(response) {
+  return response?.deposit || response?.data || null;
+}
 
 function paymentImage(response) {
-  return response.qris_image || response.qr_image || response.image || null;
+  const dep = paymentDeposit(response);
+  return (
+    dep?.qr_image || dep?.qris_image ||
+    response.qr_image || response.qris_image ||
+    dep?.image || response.image || null
+  );
 }
 
 function paymentReference(response) {
-  return response.invoice_id || null;
+  const dep = paymentDeposit(response);
+  return dep?.transaction_id || dep?.id || response.transaction_id || response.invoice_id || null;
 }
 
 function paymentTotal(response, fallback = PRICE) {
-  return response.total || response.amount || fallback;
+  const dep = paymentDeposit(response);
+  return dep?.amount || response.total || response.amount || fallback;
 }
 
 function paymentNominal(response, fallback) {
+  const dep = paymentDeposit(response);
+  if (dep && typeof dep.amount === 'number') {
+    const fee = Number(dep.fee || 0);
+    const uniq = Number(dep.unique_code || 0);
+    if (fee || uniq) return dep.amount - fee - uniq;
+    return fallback;
+  }
   return response.amount || fallback;
 }
 
 function paymentExpiredAt(response) {
-  return response.expired_at || null;
+  const dep = paymentDeposit(response);
+  return dep?.expired_at || response.expired_at || response.expiredAt || null;
 }
 
 const PAID_STATUSES = new Set([
@@ -181,28 +204,35 @@ function getChatId(ctx) {
 }
 
 async function createQris(nominal = PRICE) {
-  const url = `${config.topupUrl}${config.topupUrl.includes('?') ? '&' : '?'}apikey=${encodeURIComponent(config.qrisToken)}&amount=${encodeURIComponent(nominal)}`;
-  const response = await fetch(url, { method: 'GET' });
+  const url = `${config.topupUrl}${config.topupUrl.includes('?') ? '&' : '?'}apikey=${encodeURIComponent(config.qrisToken)}`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ amount: Number(nominal) }),
+  });
   const body = await response.json().catch(() => ({}));
+  if (response.status === 429)
+    throw new Error('Terlalu sering bikin QR. Tunggu sebentar lalu buat lagi.');
   if (!response.ok || body.success === false)
     throw new Error(body.message || body.error || `QRIS HTTP ${response.status}`);
   const image = paymentImage(body);
   const reference = paymentReference(body);
   if (!image || !reference) {
     throw new Error(
-      `Respons invoice tak dikenali (butuh qris_image + invoice_id). Dapat: ${JSON.stringify(body).slice(0, 300)}`
+      `Respons deposit tak dikenali (butuh deposit.qr_image + deposit.transaction_id). Dapat: ${JSON.stringify(body).slice(0, 300)}`
     );
   }
+  const dep = paymentDeposit(body);
   return {
     image,
-    content: null,
+    content: dep?.qr_string || null,
     reference,
     total: paymentTotal(body, nominal),
     nominal: paymentNominal(body, nominal),
     expiredAt: paymentExpiredAt(body),
     cancelUrl: null,
-    checkUrl: body.payment_link || null,
-    paymentLink: body.payment_link || null,
+    checkUrl: null,
+    paymentLink: null,
     raw: body,
   };
 }
@@ -210,17 +240,28 @@ async function createQris(nominal = PRICE) {
 async function checkPayment(order) {
   const reference = order.reference;
   if (!reference) return false;
-  const url = `${config.statusUrl}${config.statusUrl.includes('?') ? '&' : '?'}apikey=${encodeURIComponent(config.qrisToken)}&invoice_id=${encodeURIComponent(reference)}`;
+  const base = String(config.statusUrl).replace(/\/+$/, '');
+  const url = `${base}/check/${encodeURIComponent(reference)}?apikey=${encodeURIComponent(config.qrisToken)}`;
   const response = await fetch(url, { method: 'GET' });
   const body = await response.json().catch(() => ({}));
-  if (response.status === 404) return false; // invoice tak ada = belum bayar / salah id
+  if (response.status === 404) return false; // transaksi tak ada = belum bayar / salah id
   if (!response.ok) throw new Error(body.message || body.error || `Status QRIS HTTP ${response.status}`);
   return paid(body);
 }
 
-// XentraPay tak sediakan cancel API: batal = stop polling + tandai cancelled lokal.
-// Invoice pending expired otomatis (±15 mnt). Tak ada dana ketahan karena belum dibayar.
+// Payment PUNYA cancel API: POST {cancelUrl}/:transactionId.
+// Batal = stop polling + tandai cancelled lokal (dipanggil setelah cek paid).
 async function cancelPayment(order) {
+  const reference = order?.reference;
+  if (!reference) return true;
+  const base = String(config.cancelUrl).replace(/\/+$/, '');
+  const url = `${base}/${encodeURIComponent(reference)}?apikey=${encodeURIComponent(config.qrisToken)}`;
+  const response = await fetch(url, { method: 'POST' });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok && response.status !== 400)
+    throw new Error(body.message || body.error || `Cancel QRIS HTTP ${response.status}`);
+  if (body.success === false && /paid|lunas|berhasil/i.test(String(body.message || '')))
+    throw new Error('Deposit sudah dibayar, tidak bisa dibatalkan.');
   return true;
 }
 
@@ -970,8 +1011,8 @@ async function showSaldo(ctx) {
   );
 }
 
-// Kirim QR sebagai foto (tanpa link): gambar di-download server lalu di-upload
-// sebagai file, jadi Telegram tidak perlu fetch URL host gambar (sering gagal).
+// Kirim QR sebagai foto: dukung base64 data URL (qr_image)
+// maupun URL http. Buffer dikirim langsung biar Telegram tak perlu fetch.
 async function sendQrisPhoto(ctx, qris, order, caption) {
   const buttons = Markup.inlineKeyboard([
     [Markup.button.callback('✅ Cek pembayaran', `check:${order.id}`)],
@@ -982,6 +1023,26 @@ async function sendQrisPhoto(ctx, qris, order, caption) {
     ...buttons,
   };
   let sent = false;
+  // qr_image = "data:image/png;base64,...." -> decode langsung
+  if (typeof qris.image === 'string' && qris.image.startsWith('data:image')) {
+    try {
+      const b64 = qris.image.split(',', 2)[1] || '';
+      const buf = Buffer.from(b64, 'base64');
+      if (!buf.length) throw new Error('Gambar kosong');
+      await ctx.replyWithPhoto({ source: buf }, photoOpts);
+      sent = true;
+    } catch {}
+  }
+  if (!sent && typeof qris.image === 'string' && qris.image.startsWith('data:')) {
+    try {
+      const b64 = qris.image.split(',', 2)[1] || '';
+      const buf = Buffer.from(b64, 'base64');
+      if (buf.length) {
+        await ctx.replyWithPhoto({ source: buf }, photoOpts);
+        sent = true;
+      }
+    } catch {}
+  }
   try {
     const imgRes = await fetch(qris.image);
     if (!imgRes.ok) throw new Error(`Gambar HTTP ${imgRes.status}`);
@@ -1056,9 +1117,8 @@ bot.action('buy', async (ctx) => {
 
 // ---- Deposit / Top Up Saldo ----
 // DUA KANTONG (jangan ketuker):
-// - Saldo VPS (XentraPay QRIS): buat beli VPS. Duit parkir di XentraPay, bisa withdraw.
-// - Saldo OTP (RumahOTP QRIS): buat beli nokos. Duit masuk ke provider (owner), NON-withdrawable.
-// VPS tetap bayar via XentraPay. Nanti kalau untung, semua pay pindah ke XentraPay (tinggal bilang).
+// - Saldo VPS: buat beli VPS.
+// - Saldo OTP: buat beli nokos.
 const TOPUP_OPTIONS = [2000, 5000, 10000, 20000, 50000, 100000];
 const OTP_TOPUP_OPTIONS = [2000, 5000, 10000, 20000, 50000];
 
@@ -1078,7 +1138,7 @@ bot.action('topup', async (ctx) => {
     return;
   }
   await ctx.reply(
-    `➕ Top Up Saldo\nPilih kantong:\n🖥️ VPS → QRIS XentraPay (bisa withdraw)\n📱 OTP → QRIS RumahOTP (masuk provider, buat beli nokos)`,
+    `➕ Top Up Saldo\nPilih kantong:\n🖥️ Saldo VPS\n📱 Saldo OTP (buat beli nokos)`,
     Markup.inlineKeyboard([
       [Markup.button.callback('🖥️ Saldo VPS', 'topup_vps'), Markup.button.callback('📱 Saldo OTP', 'topup_otp')],
     ])
@@ -1088,7 +1148,7 @@ bot.action('topup', async (ctx) => {
 bot.action('topup_vps', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   await ctx.reply(
-    `🖥️ Top Up Saldo VPS (XentraPay)\nPilih nominal (saldo masuk sebesar nominal ini, kode unik tidak dihitung):`,
+    `🖥️ Top Up Saldo VPS\nPilih nominal (saldo masuk sebesar nominal ini, kode unik tidak dihitung):`,
     Markup.inlineKeyboard([
       [Markup.button.callback('Rp2.000', 'topup:2000'), Markup.button.callback('Rp5.000', 'topup:5000')],
       [Markup.button.callback('Rp10.000', 'topup:10000'), Markup.button.callback('Rp20.000', 'topup:20000')],
@@ -1099,9 +1159,9 @@ bot.action('topup_vps', async (ctx) => {
 
 bot.action('topup_otp', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  if (!nokosOn()) { await ctx.reply('❌ Saldo OTP belum aktif (RUMAHOTP_KEY kosong).'); return; }
+  if (!nokosOn()) { await ctx.reply('❌ Saldo OTP belum aktif. Hubungi admin.'); return; }
   await ctx.reply(
-    `📱 Top Up Saldo OTP (RumahOTP, min Rp2.000)\nDuit masuk ke provider, dipakai beli nokos.\n⚠️ Saldo provider TIDAK bisa di-withdraw — isi sebutuhnya.`,
+    `📱 Top Up Saldo OTP (min Rp2.000)\nDipakai buat beli nokos.\n⚠️ Saldo OTP tidak bisa ditarik — isi sebutuhnya.`,
     Markup.inlineKeyboard([
       [Markup.button.callback('Rp2.000', 'topupotp:2000'), Markup.button.callback('Rp5.000', 'topupotp:5000')],
       [Markup.button.callback('Rp10.000', 'topupotp:10000'), Markup.button.callback('Rp20.000', 'topupotp:20000')],
@@ -1116,7 +1176,7 @@ bot.action(/^topupotp:(\d+)$/, async (ctx) => {
   if (!OTP_TOPUP_OPTIONS.includes(nominal)) return ctx.answerCbQuery('Nominal tidak valid.');
   let dep = null;
   try { dep = await createDeposit(nominal, 'qris'); }
-  catch (e) { await ctx.reply(`Gagal bikin QRIS provider: ${e.message}`); return; }
+  catch (e) { await ctx.reply(`Gagal bikin QRIS: ${e.message}`); return; }
   const chatId = getChatId(ctx);
   const order = {
     id: randomUUID(),
@@ -1139,7 +1199,7 @@ bot.action(/^topupotp:(\d+)$/, async (ctx) => {
     `📱 Top up Saldo OTP ${formatRupiah(dep.diterima || nominal)} lewat QR ini.\nBayar ${formatRupiah(dep.total)} (termasuk fee).\n\nDeposit: ${dep.id}\n${qrisExpiryText({ expiredAt: dep.expired_at })}`);
 });
 
-// Kredit saldo OTP yang sudah dibayar via QRIS provider.
+// Kredit saldo OTP yang sudah dibayar via QRIS.
 async function creditOtpTopup(orderId) {
   const orders = await readJson(ordersFile);
   const order = orders[orderId];
@@ -1267,9 +1327,9 @@ bot.action('buy_balance', async (ctx) => {
   await ctx.answerCbQuery('Pembayaran saldo berhasil. Data dikirim.');
 });
 
-// ================= NOKOS (RumahOTP auto-order) =================
-// Flow: katalog (WA/TG Indo) -> harga termurah ready -> bayar QRIS/saldo
-//   -> order V2 ke rumahotp (number_id 2381 Indo) -> polling get_status
+// ================= NOKOS (auto-order nomor OTP) =================
+// Flow: katalog -> harga termurah ready -> bayar QRIS/saldo
+//   -> order nomor -> polling status
 //   -> OTP diteruskan ke user. Expired/timeout -> auto cancel (refund).
 const nokosTimers = new Map();
 
@@ -1286,11 +1346,11 @@ async function countActiveNokos(chatId) {
   } catch { return 0; }
 }
 
-// Cek saldo owner di provider cukup buat modal? Fail-fast sebelum user bayar.
-async function providerReady(modal) {
+// Cek stok nomor cukup? Fail-fast sebelum user bayar.
+async function providerReady(butuh) {
   try {
     const b = await otpBalance();
-    return { ok: Number(b?.balance || 0) >= Number(modal || 0), balance: Number(b?.balance || 0) };
+    return { ok: Number(b?.balance || 0) >= Number(butuh || 0), balance: Number(b?.balance || 0) };
   } catch (e) {
     return { ok: false, balance: 0, error: e.message };
   }
@@ -1325,7 +1385,7 @@ async function pollNokos(orderId) {
     order.status = 'expired';
     await writeJson(ordersFile, orders);
     stopNokosPoll(orderId);
-    await bot.telegram.sendMessage(order.chatId, `⏰ Order nokos ${order.phone} expired & auto-cancel.\nSaldo provider balik otomatis.`).catch(() => {});
+    await bot.telegram.sendMessage(order.chatId, `⏰ Order nokos ${order.phone} expired & auto-cancel.\nSaldo otomatis balik.`).catch(() => {});
     return;
   }
   let st = null;
@@ -1345,7 +1405,7 @@ async function pollNokos(orderId) {
 }
 
 // Dipanggil setelah QRIS/saldo lunas untuk order nokos_pending:
-// potong saldo provider = order beneran ke rumahotp, kirim nomor ke user.
+// ambil nomor beneran, kirim ke user.
 async function activateNokos(orderId) {
   const orders = await readJson(ordersFile);
   const order = orders[orderId];
@@ -1363,7 +1423,7 @@ async function activateNokos(orderId) {
     order.status = 'failed';
     order.failReason = e.message;
     await writeJson(ordersFile, orders);
-    // User SUDAH bayar (QRIS lunas / saldo kepotong) tapi provider gagal:
+    // User SUDAH bayar (QRIS lunas / saldo kepotong) tapi ambil nomor gagal:
     // refund otomatis ke saldo bot biar user ga rugi, admin tinggal beresin.
     if (order.payMethod === 'qris') {
       try {
@@ -1377,8 +1437,8 @@ async function activateNokos(orderId) {
         await writeJson(ordersFile, orders);
       } catch {}
     }
-    await bot.telegram.sendMessage(order.chatId, `❌ Gagal order nomor ke provider: ${e.message}\n${order.payMethod === 'qris' ? `💰 ${formatRupiah(order.total)} OTOMATIS balik jadi saldo bot kamu. Cek /saldo.` : `💰 Saldo kamu TIDAK kepotong, aman.`}\nSimpan ref: ${order.reference || order.id}`).catch(() => {});
-    await notifyAdmins(`🚨 NOKOS GAGAL\n👤 ${order.buyerName} (${order.chatId})\n📦 ${order.serviceLabel || ''} ${order.countryLabel || ''}\n💰 ${formatRupiah(order.total)} (${order.payMethod}) — provider gagal: ${e.message}\n${order.payMethod === 'qris' ? '✅ Auto-refund ke saldo bot user.' : 'Saldo user aman (belum dipotong).'}\nRef: ${order.reference || order.id}`);
+    await bot.telegram.sendMessage(order.chatId, `❌ Gagal ambil nomor: ${e.message}\n${order.payMethod === 'qris' ? `💰 ${formatRupiah(order.total)} OTOMATIS balik jadi saldo bot kamu. Cek /saldo.` : `💰 Saldo kamu TIDAK kepotong, aman.`}\nSimpan ref: ${order.reference || order.id}`).catch(() => {});
+    await notifyAdmins(`🚨 NOKOS GAGAL\n👤 ${order.buyerName} (${order.chatId})\n📦 ${order.serviceLabel || ''} ${order.countryLabel || ''}\n💰 ${formatRupiah(order.total)} (${order.payMethod}) — gagal ambil nomor: ${e.message}\n${order.payMethod === 'qris' ? '✅ Auto-refund ke saldo bot user.' : 'Saldo user aman (belum dipotong).'}\nRef: ${order.reference || order.id}`);
     return false;
   }
   order.kind = 'nokos';
@@ -1431,10 +1491,10 @@ function nokosFavRows() {
 }
 
 bot.command('nokos', async (ctx) => {
-  if (!nokosOn()) { await ctx.reply('❌ Fitur nokos belum aktif (RUMAHOTP_KEY kosong).'); return; }
+  if (!nokosOn()) { await ctx.reply('❌ Fitur nokos belum aktif. Hubungi admin.'); return; }
   const mine = await nokosActiveList(getChatId(ctx));
   await ctx.reply(
-    `📱 Nokos OTP — semua layanan + semua negara\nHarga = modal provider + ${formatRupiah(config.nokosMarkup)} (untung lu)\nAktif kamu: ${mine.length}/${config.nokosMaxActive}\n${mine.map((o) => `• ${o.serviceLabel} ${o.phone} (${o.roOrderId})`).join('\n')}\n\nJalur cepat atau browser lengkap:`,
+    `📱 Nokos OTP — semua layanan + semua negara\nAktif kamu: ${mine.length}/${config.nokosMaxActive}\n${mine.map((o) => `• ${o.serviceLabel} ${o.phone} (${o.roOrderId})`).join('\n')}\n\nJalur cepat atau browser lengkap:`,
     Markup.inlineKeyboard([...nokosFavRows(), [Markup.button.callback('🔍 Semua layanan', 'nks:0')]])
   );
 });
@@ -1502,10 +1562,10 @@ bot.action(/^nsvc:(\d+):(\d+)$/, async (ctx) => {
   nav.push(Markup.button.callback(`${p + 1}/${total}`, 'nokos_noop'));
   if (p < total - 1) nav.push(Markup.button.callback('▶️', `nsvc:${serviceId}:${p + 1}`));
   kb.push(nav);
-  await ctx.reply(`🌍 ${label} — pilih negara (hal ${p + 1}/${total}, harga jual termurah):`, Markup.inlineKeyboard(kb));
+  await ctx.reply(`🌍 ${label} — pilih negara (hal ${p + 1}/${total}, harga termurah):`, Markup.inlineKeyboard(kb));
 });
 
-// ---- Pilih provider per negara (termurah dulu, top 8) ----
+// ---- Pilih nomor per negara (termurah dulu, top 8) ----
 bot.action(/^nky:(\d+):(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const serviceId = Number(ctx.match[1]);
@@ -1518,12 +1578,12 @@ bot.action(/^nky:(\d+):(\d+)$/, async (ctx) => {
   const label = await serviceLabel(serviceId);
   const list = (row.pricelist || []).filter((p) => p.available !== false && Number(p.stock) > 0);
   list.sort((a, b) => Number(a.price) - Number(b.price));
-  if (!list.length) { await ctx.reply('❌ Provider negara ini lagi kosong.'); return; }
+  if (!list.length) { await ctx.reply('❌ Nomor negara ini lagi kosong.'); return; }
   const kb = list.slice(0, NOKOS_PAGE).map((p) => [Markup.button.callback(
     `💰 ${formatRupiah(sellPrice(p.price))} — stok ${p.stock} (server ${p.server_id})`,
     `nkp:${serviceId}:${numberId}:${p.provider_id}`
   )]);
-  await ctx.reply(`🏭 ${label} — ${row.name} (${row.prefix})\nPilih provider (harga jual, termurah dulu):`, Markup.inlineKeyboard(kb));
+  await ctx.reply(`🏭 ${label} — ${row.name} (${row.prefix})\nPilih (termurah dulu):`, Markup.inlineKeyboard(kb));
 });
 
 bot.action(/^nk:(\d+)$/, async (ctx) => {
@@ -1547,9 +1607,9 @@ async function showNokosDetail(ctx, serviceId, numberId, providerId, force) {
   const tag = `${meta.label} — ${meta.row.name} (${meta.row.prefix})`;
   await ctx.reply(
     `📱 ${tag}\n` +
-    `🏭 Provider ${meta.best.provider_id} (server ${meta.best.server_id}) | stok: ${meta.best.stock}\n` +
-    `💰 Modal ${formatRupiah(meta.best.price)} → jual ${formatRupiah(meta.jual)}\n` +
-    `⏰ Nomor aktif ${config.nokosTimeoutMinutes} mnt, OTP auto-forward.${force ? '\n🔄 Harga fresh dari provider.' : ''}\n\nBayar pakai:`,
+    `📦 Stok: ${meta.best.stock}\n` +
+    `💰 Harga ${formatRupiah(meta.jual)}\n` +
+    `⏰ Nomor aktif ${config.nokosTimeoutMinutes} mnt, OTP auto-forward.${force ? '\n🔄 Harga fresh.' : ''}\n\nBayar pakai:`,
     Markup.inlineKeyboard([
       [Markup.button.callback(`🛒 QRIS ${formatRupiah(meta.jual)}`, `nbuy:${serviceId}:${meta.row.number_id}:${meta.best.provider_id}`)],
       [Markup.button.callback(`💰 Saldo ${formatRupiah(meta.jual)}`, `nbuybal:${serviceId}:${meta.row.number_id}:${meta.best.provider_id}`)],
@@ -1573,7 +1633,7 @@ async function prepareNokosMeta(serviceId, numberId = null, providerId = null, f
   let best = null;
   if (providerId) {
     best = (row.pricelist || []).find((p) => String(p.provider_id) === String(providerId) && p.available !== false && Number(p.stock) > 0);
-    if (!best) throw new Error('Provider itu baru aja habis. Balik & pilih lain.');
+    if (!best) throw new Error('Nomor itu baru aja habis. Balik & pilih lain.');
   } else {
     best = cheapestProvider(row);
   }
@@ -1608,8 +1668,8 @@ bot.action(/^nbuy:(\d+)(?::(\d+):([^:]+))?$/, async (ctx) => {
   catch (e) { await ctx.reply(`Gagal: ${e.message}`); return; }
   const ready = await providerReady(meta.best.price);
   if (!ready.ok) {
-    await ctx.reply(`❌ Stok provider lagi bermasalah (saldo owner kurang). Jangan bayar dulu — hubungi admin.`);
-    await notifyAdmins(`⚠️ NOKOS DITAHAN (QRIS)\n👤 ${ctx.from?.first_name} (${getChatId(ctx)}) mau beli ${meta.label} ${meta.row.name} ${formatRupiah(meta.jual)}.\nSaldo provider: ${formatRupiah(ready.balance)} — KURANG. Topup dashboard (min 2rb).`);
+    await ctx.reply(`❌ Stok nomor lagi habis. Jangan bayar dulu — hubungi admin.`);
+    await notifyAdmins(`⚠️ NOKOS DITAHAN (QRIS)\n👤 ${ctx.from?.first_name} (${getChatId(ctx)}) mau beli ${meta.label} ${meta.row.name} ${formatRupiah(meta.jual)}.\nStok nomor habis — cek dashboard.`);
     return;
   }
   let qris = null;
@@ -1645,27 +1705,27 @@ bot.action(/^nbuybal:(\d+)(?::(\d+):([^:]+))?$/, async (ctx) => {
   const users = await readJson(usersFile);
   const bal = Number(users?.[chatId]?.nokosBalance || 0);
   if (bal < meta.jual) {
-    await ctx.reply(`📱 Saldo OTP ${formatRupiah(bal)} kurang (butuh ${formatRupiah(meta.jual)}). Top up Saldo OTP dulu ya (masuk provider).`, Markup.inlineKeyboard([[Markup.button.callback('📱 Top Up Saldo OTP', 'topup_otp')]]));
+    await ctx.reply(`📱 Saldo OTP ${formatRupiah(bal)} kurang (butuh ${formatRupiah(meta.jual)}). Top up Saldo OTP dulu ya.`, Markup.inlineKeyboard([[Markup.button.callback('📱 Top Up Saldo OTP', 'topup_otp')]]));
     return;
   }
   if ((await countActiveNokos(chatId)) >= config.nokosMaxActive) {
     await ctx.reply(`❌ Max ${config.nokosMaxActive} nokos aktif.`);
     return;
   }
-  // Cek saldo OWNER di provider dulu — jangan potong user kalau owner tekor.
+  // Cek stok nomor dulu — jangan potong user kalau stok habis.
   const ready = await providerReady(meta.best.price);
   if (!ready.ok) {
-    await ctx.reply(`❌ Stok provider lagi bermasalah (saldo owner kurang / error: ${ready.error || formatRupiah(ready.balance)}).\n💰 Saldo kamu AMAN, tidak kepotong. Hubungi admin.`);
-    await notifyAdmins(`⚠️ NOKOS DITAHAN\n👤 ${ctx.from?.first_name} (${chatId}) mau beli ${meta.label} ${meta.row.name} ${formatRupiah(meta.jual)}, modal ${formatRupiah(meta.best.price)}.\nSaldo provider: ${formatRupiah(ready.balance)} — KURANG. Topup di dashboard rumahotp (min 2rb).`);
+    await ctx.reply(`❌ Stok nomor lagi habis.\n💰 Saldo kamu AMAN, tidak kepotong. Hubungi admin.`);
+    await notifyAdmins(`⚠️ NOKOS DITAHAN\n👤 ${ctx.from?.first_name} (${chatId}) mau beli ${meta.label} ${meta.row.name} ${formatRupiah(meta.jual)}.\nStok nomor habis — cek dashboard.`);
     return;
   }
-  // Order ke provider DULU, potong saldo user KALAU sukses. Urutan ini anti-rugi.
+  // Ambil nomor DULU, potong saldo user KALAU sukses. Urutan ini anti-rugi.
   let ro = null;
   try {
     ro = await createOrderV2(meta.row.number_id, String(meta.best.provider_id), meta.operatorId);
   } catch (e) {
-    await ctx.reply(`❌ Gagal order nomor ke provider: ${e.message}\n💰 Saldo kamu AMAN, tidak kepotong.`);
-    await notifyAdmins(`🚨 NOKOS GAGAL (saldo user aman)\n👤 ${ctx.from?.first_name} (${chatId})\n📦 ${meta.label} ${meta.row.name} — provider gagal: ${e.message}`);
+    await ctx.reply(`❌ Gagal ambil nomor: ${e.message}\n💰 Saldo kamu AMAN, tidak kepotong.`);
+    await notifyAdmins(`🚨 NOKOS GAGAL (saldo user aman)\n👤 ${ctx.from?.first_name} (${chatId})\n📦 ${meta.label} ${meta.row.name} — gagal ambil nomor: ${e.message}`);
     return;
   }
   users[chatId] = { ...(users[chatId] || {}), nokosBalance: bal - meta.jual, name: ctx.from?.first_name || users[chatId]?.name };
@@ -1722,15 +1782,15 @@ bot.action(/^nkx:(.+)$/, async (ctx) => {
   await writeJson(ordersFile, orders);
   stopNokosPoll(order.id);
   await ctx.answerCbQuery('Order dibatalkan.');
-  await ctx.reply(`❌ Nokos ${order.phone} dibatalkan. Saldo provider balik otomatis.`);
+  await ctx.reply(`❌ Nokos ${order.phone} dibatalkan. Saldo otomatis balik.`);
 });
 
 bot.command('nokosaldo', async (ctx) => {
   if (!isAdmin(ctx)) return;
   try {
     const b = await otpBalance();
-    await ctx.reply(`📱 Saldo RumahOTP: ${b.formated || formatRupiah(b.balance)}\nUser: ${b.username || '-'}`);
-  } catch (e) { await ctx.reply(`Gagal cek saldo provider: ${e.message}\n(Isi RUMAHOTP_KEY dulu + topup di dashboard)`); }
+    await ctx.reply(`📱 Saldo stok nomor: ${b.formated || formatRupiah(b.balance)}\nUser: ${b.username || '-'}`);
+  } catch (e) { await ctx.reply(`Gagal cek stok nomor: ${e.message}`); }
 });
 
 bot.action(/^check:(.+)$/, async (ctx) => {
@@ -1929,7 +1989,7 @@ bot.command('admin', async (ctx) => {
     `/stok — cek stok\n` +
     `/tambahstok — tambah stok\n` +
     `/tambahsaldo <id> <nominal> — tambah saldo user\n` +
-    `/nokosaldo — cek saldo RumahOTP\n` +
+     `/nokosaldo — cek saldo stok nomor\n` +
     `/riwayat [n] — order terakhir\n` +
     `/balas <id> <pesan> — balas pesan user (contact)\n` +
     `/spek — kartu spek VPS\n\n` +
