@@ -4,7 +4,7 @@ import { access, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHmac } from 'node:crypto';
 import {
   balance as otpBalance,
   cachedServices,
@@ -49,8 +49,11 @@ const UNIT_PRICE = Number(process.env.PRICE || 1000); // 1 VPS = 1k, tanpa minim
 
 const config = {
   qrisToken: process.env.QRIS_TOKEN,
+  qrisSecret: process.env.QRIS_API_SECRET || '',
   // Payment QRIS: auth ?apikey=... + IP whitelist di dashboard.
   // QRIS_TOKEN di .env = apikey payment (apg_live_...).
+  // Kalau API secret (HMAC) aktif di dashboard, wajib isi QRIS_API_SECRET:
+  // request dikirim lewat header X-API-Key + X-Timestamp + X-Signature.
   // Endpoin bawaan di bawah; override via .env bila perlu.
   topupUrl: process.env.QRIS_TOPUP_URL || 'https://austinstore.id/api/deposit/create',
   statusUrl: process.env.QRIS_STATUS_URL || 'https://austinstore.id/api/deposit',
@@ -175,6 +178,35 @@ function paymentExpiredAt(response) {
   return dep?.expired_at || response.expired_at || response.expiredAt || null;
 }
 
+// HMAC: kalau QRIS_API_SECRET diisi (secret aktif di dashboard),
+// key dikirim via header X-API-Key + request ditandatangani:
+//   signature = HMAC-SHA256(secret, "METHOD\nPATH\nBODY\nTIMESTAMP") hex,
+//   header X-Signature + X-Timestamp. PATH = pathname murni tanpa query,
+//   BODY = raw JSON persis yg dikirim ("" kalau tanpa body).
+function paymentPath(url, fallback) {
+  try {
+    return new URL(url).pathname.replace(/\/+$/, '') || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function paymentSignedHeaders(method, path, bodyStr) {
+  const timestamp = Date.now().toString();
+  const payload = `${method}\n${path}\n${bodyStr}\n${timestamp}`;
+  const signature = createHmac('sha256', config.qrisSecret).update(payload).digest('hex');
+  return {
+    'Content-Type': 'application/json',
+    'X-API-Key': config.qrisToken,
+    'X-Timestamp': timestamp,
+    'X-Signature': signature,
+  };
+}
+
+function paymentKeyQuery(url) {
+  return `${url}${url.includes('?') ? '&' : '?'}apikey=${encodeURIComponent(config.qrisToken)}`;
+}
+
 const PAID_STATUSES = new Set([
   'paid', 'success', 'settlement', 'berhasil', 'sukses',
   'lunas', 'done', 'completed', 'complete', 'ok', 'approved', 'settled',
@@ -204,11 +236,19 @@ function getChatId(ctx) {
 }
 
 async function createQris(nominal = PRICE) {
-  const url = `${config.topupUrl}${config.topupUrl.includes('?') ? '&' : '?'}apikey=${encodeURIComponent(config.qrisToken)}`;
+  const bodyStr = JSON.stringify({ amount: Number(nominal) });
+  let url = config.topupUrl;
+  let headers = { 'Content-Type': 'application/json' };
+  if (config.qrisSecret) {
+    const path = paymentPath(url, '/api/deposit/create');
+    headers = paymentSignedHeaders('POST', path, bodyStr);
+  } else {
+    url = paymentKeyQuery(url);
+  }
   const response = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ amount: Number(nominal) }),
+    headers,
+    body: bodyStr,
   });
   const body = await response.json().catch(() => ({}));
   if (response.status === 429)
@@ -241,8 +281,15 @@ async function checkPayment(order) {
   const reference = order.reference;
   if (!reference) return false;
   const base = String(config.statusUrl).replace(/\/+$/, '');
-  const url = `${base}/check/${encodeURIComponent(reference)}?apikey=${encodeURIComponent(config.qrisToken)}`;
-  const response = await fetch(url, { method: 'GET' });
+  let url = `${base}/check/${encodeURIComponent(reference)}`;
+  let headers;
+  if (config.qrisSecret) {
+    const path = `${paymentPath(base, '/api/deposit')}/check/${encodeURIComponent(reference)}`;
+    headers = paymentSignedHeaders('GET', path, '');
+  } else {
+    url = paymentKeyQuery(url);
+  }
+  const response = await fetch(url, { method: 'GET', ...(headers ? { headers } : {}) });
   const body = await response.json().catch(() => ({}));
   if (response.status === 404) return false; // transaksi tak ada = belum bayar / salah id
   if (!response.ok) throw new Error(body.message || body.error || `Status QRIS HTTP ${response.status}`);
@@ -255,8 +302,15 @@ async function cancelPayment(order) {
   const reference = order?.reference;
   if (!reference) return true;
   const base = String(config.cancelUrl).replace(/\/+$/, '');
-  const url = `${base}/${encodeURIComponent(reference)}?apikey=${encodeURIComponent(config.qrisToken)}`;
-  const response = await fetch(url, { method: 'POST' });
+  let url = `${base}/${encodeURIComponent(reference)}`;
+  let headers;
+  if (config.qrisSecret) {
+    const path = `${paymentPath(base, '/api/deposit/cancel')}/${encodeURIComponent(reference)}`;
+    headers = paymentSignedHeaders('POST', path, '');
+  } else {
+    url = paymentKeyQuery(url);
+  }
+  const response = await fetch(url, { method: 'POST', ...(headers ? { headers } : {}) });
   const body = await response.json().catch(() => ({}));
   if (!response.ok && response.status !== 400)
     throw new Error(body.message || body.error || `Cancel QRIS HTTP ${response.status}`);
