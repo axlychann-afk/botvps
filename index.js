@@ -1134,14 +1134,16 @@ async function sendQrisPhoto(ctx, qris, order, caption) {
       }
     } catch {}
   }
-  try {
-    const imgRes = await fetch(qris.image);
-    if (!imgRes.ok) throw new Error(`Gambar HTTP ${imgRes.status}`);
-    const buf = Buffer.from(await imgRes.arrayBuffer());
-    if (!buf.length) throw new Error('Gambar kosong');
-    await ctx.replyWithPhoto({ source: buf }, photoOpts);
-    sent = true;
-  } catch {}
+  if (!sent) {
+    try {
+      const imgRes = await fetch(qris.image);
+      if (!imgRes.ok) throw new Error(`Gambar HTTP ${imgRes.status}`);
+      const buf = Buffer.from(await imgRes.arrayBuffer());
+      if (!buf.length) throw new Error('Gambar kosong');
+      await ctx.replyWithPhoto({ source: buf }, photoOpts);
+      sent = true;
+    } catch {}
+  }
   if (!sent) {
     try {
       await ctx.replyWithPhoto({ url: qris.image }, photoOpts);
