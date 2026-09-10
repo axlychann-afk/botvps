@@ -82,6 +82,65 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 let stockLock = Promise.resolve();
 const pollTimers = new Map();
 
+// ---- Panel Legal (bayar QRIS otomatis, delivery manual via admin) ----
+const PANEL_PLANS = [
+  { id: '1', label: '1 GB • 1024 MB • 1024 MB • 40%', price: 1000 },
+  { id: '2', label: '2 GB • 2048 MB • 2048 MB • 60%', price: 2000 },
+  { id: '3', label: '3 GB • 3072 MB • 3072 MB • 80%', price: 3000 },
+  { id: '4', label: '4 GB • 4096 MB • 4096 MB • 100%', price: 4000 },
+  { id: '5', label: '5 GB • 5120 MB • 5120 MB • 110%', price: 5000 },
+  { id: '6', label: '6 GB • 6144 MB • 6144 MB • 120%', price: 6000 },
+  { id: '7', label: '7 GB • 7168 MB • 7168 MB • 130%', price: 7000 },
+  { id: '8', label: '8 GB • 8192 MB • 8192 MB • 140%', price: 8000 },
+  { id: '9', label: '9 GB • 9216 MB • 9216 MB • 150%', price: 9000 },
+  { id: '10', label: '10 GB • 10240 MB • 10240 MB • 200%', price: 10000 },
+  { id: 'unli', label: 'Unlimited • ∞ • ∞ • ∞', price: 15000 },
+];
+// chatId -> planId yang lagi nunggu input username
+const panelWaitUsername = new Map();
+// chatId -> { planId, username } yang lagi pilih metode bayar
+const pendingPanelPay = new Map();
+
+function panelPlanById(id) {
+  return PANEL_PLANS.find((p) => p.id === String(id));
+}
+
+function panelListKeyboard() {
+  const rows = [];
+  for (const p of PANEL_PLANS) {
+    rows.push([Markup.button.callback(`📦 ${p.label} — ${formatRupiah(p.price)}`, `pbuy:${p.id}`)]);
+  }
+  rows.push([Markup.button.callback('⬅️ Kembali', 'cek_stok')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+function panelIntroText() {
+  const list = PANEL_PLANS.map((p) => `• ${p.label} — ${formatRupiah(p.price)}`).join('\n');
+  return `🛡️ PANEL LEGAL — FULL GARANSI 30 HARI ✅\n\n` +
+    `Panel ini LEGAL 100%.\n` +
+    `Baal? Ganti baru / ON 30 DAY FULL GARANSI.\n\n` +
+    `📋 List Panel:\n${list}\n\n` +
+    `👇 Pilih salah satu di bawah, lalu masukkan username panel yang kamu mau.`;
+}
+
+// Order panel lunas: notif admin + pesan tunggu ke user.
+// Testi TIDAK auto — nunggu admin /balas dulu, buyer ditanya mau kirim testi apa enggak.
+async function afterPanelPaid(order) {
+  const planLabel = order.panelLabel || order.panelId;
+  const via = order.payMethod === 'balance' ? 'SALDO' : 'QRIS';
+  try {
+    await notifyAdmins(
+      `🛒 Ada yang beli panel!\n👤 ${order.buyerName || 'User'} (${order.chatId})\n📦 Panel ${planLabel}\n👤 Username: ${order.panelUsername || '-'}\n💰 ${formatRupiah(order.total || 0)} via ${via}\nRef: ${order.reference || order.id}\n\nBalas pakai:\n/balas ${order.chatId} <detail panel / user / pass>`
+    );
+  } catch {}
+  try {
+    await bot.telegram.sendMessage(
+      order.chatId,
+      `✅ Pembayaran berhasil!\n📦 Panel ${planLabel} (${order.panelUsername || '-'})\n\nPesanan akan diproses, tunggu balasan admin ya 🙏`
+    );
+  } catch {}
+}
+
 // ---- Helpers file ----
 async function ensureData() {
   await mkdir(dataDir, { recursive: true });
@@ -720,6 +779,10 @@ async function verifyAndDeliver(ctx, id, { auto = false } = {}) {
     if (!auto) await ctx.answerCbQuery('Deposit sudah diproses.');
     return true;
   }
+  if (order.status === 'paid_panel') {
+    if (!auto) await ctx.answerCbQuery('Pembayaran berhasil. Menunggu admin.');
+    return true;
+  }
   if (order.status === 'cancelled') {
     if (!auto) await ctx.answerCbQuery('Pesanan sudah dibatalkan.');
     return false;
@@ -734,7 +797,7 @@ async function verifyAndDeliver(ctx, id, { auto = false } = {}) {
   }
   let ok = false;
   try {
-    ok = order.kind === 'otp_topup' ? await checkDeposit(order) : await checkPayment(order);
+    ok = (order.kind === 'otp_topup' || order.provider === 'rumahotp') ? await checkDeposit(order) : await checkPayment(order);
   } catch (e) {
     if (!auto) {
       await ctx.answerCbQuery('Gagal cek pembayaran.');
@@ -757,6 +820,14 @@ async function verifyAndDeliver(ctx, id, { auto = false } = {}) {
     const credited = await creditOtpTopup(order.id);
     stopPolling(order.id);
     if (!auto) await ctx.answerCbQuery(credited ? 'Top up OTP berhasil.' : 'Sudah diproses.');
+    return true;
+  }
+  if (kind === 'panel') {
+    order.status = 'paid_panel';
+    await writeJson(ordersFile, orders);
+    stopPolling(order.id);
+    await afterPanelPaid(order);
+    if (!auto) await ctx.answerCbQuery('Pembayaran berhasil. Pesanan diproses admin.');
     return true;
   }
   if (kind === 'nokos_pending') {
@@ -809,7 +880,7 @@ async function findPendingPayment(chatId) {
     const orders = await readJson(ordersFile);
     for (const o of Object.values(orders)) {
       if (!o || o.chatId !== chatId || o.status !== 'pending' || !o.reference) continue;
-      if (!['buy', 'topup', 'nokos_pending', 'otp_topup'].includes(o.kind || 'buy')) continue;
+      if (!['buy', 'topup', 'panel', 'nokos_pending', 'otp_topup'].includes(o.kind || 'buy')) continue;
       if (isExpired(o)) continue;
       return o;
     }
@@ -844,7 +915,7 @@ async function autoCheck(orderId) {
   }
   let ok = false;
   try {
-    ok = order.kind === 'otp_topup' ? await checkDeposit(order) : await checkPayment(order);
+    ok = (order.kind === 'otp_topup' || order.provider === 'rumahotp') ? await checkDeposit(order) : await checkPayment(order);
   } catch {
     return; // coba lagi di tick berikutnya
   }
@@ -856,6 +927,17 @@ async function autoCheck(orderId) {
   }
   if ((order.kind || 'buy') === 'otp_topup') {
     await creditOtpTopup(order.id);
+    stopPolling(orderId);
+    return;
+  }
+  if ((order.kind || 'buy') === 'panel') {
+    const orders2 = await readJson(ordersFile);
+    const o2 = orders2[orderId];
+    if (o2 && o2.status === 'pending') {
+      o2.status = 'paid_panel';
+      await writeJson(ordersFile, orders2);
+      await afterPanelPaid(o2);
+    }
     stopPolling(orderId);
     return;
   }
@@ -984,6 +1066,7 @@ async function buildStart(name, chatId) {
         [Markup.button.callback(`🛒 Beli VPS • ${formatRupiah(PRICE)}`, 'buy')],
         [Markup.button.callback('📱 Beli Nokos (OTP)', 'nokos'), Markup.button.callback('💰 VPS via Saldo', 'buy_balance')],
         [Markup.button.callback('💳 Saldo Saya', 'saldo'), Markup.button.callback('➕ Top Up', 'topup')],
+        [Markup.button.callback('🛡️ Panel Legal — Garansi 30 Hari', 'panel_legal')],
       ];
   rows.push([Markup.button.callback('🆘 Bantuan', 'contact_help'), Markup.button.url('⭐ Testimoni', config.testiLink)]);
   return { text, buttons: Markup.inlineKeyboard(rows) };
@@ -1244,7 +1327,7 @@ bot.action('topup', async (ctx) => {
 bot.action('topup_vps', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   await ctx.reply(
-    `🖥️ Top Up Saldo VPS\nPilih nominal (saldo masuk sebesar nominal ini, kode unik tidak dihitung):`,
+    `🖥️ Top Up Saldo VPS\nPilih nominal (saldo masuk setelah potong fee):`,
     Markup.inlineKeyboard([
       [Markup.button.callback('Rp2.000', 'topup:2000'), Markup.button.callback('Rp5.000', 'topup:5000')],
       [Markup.button.callback('Rp10.000', 'topup:10000'), Markup.button.callback('Rp20.000', 'topup:20000')],
@@ -1323,6 +1406,14 @@ async function creditOtpTopup(orderId) {
       `📱 Topup OTP!\n👤 ${order.buyerName || 'User'} (${order.chatId})\n💰 ${formatRupiah(order.amount)} (bayar ${formatRupiah(order.total)})\n📱 Saldo OTP user: ${formatRupiah(u.nokosBalance)}\nRef: ${order.reference}`
     );
   } catch {}
+  try {
+    await sendTesti('topup', {
+      name: order.buyerName || 'Pembeli',
+      detail: 'Top Up Saldo OTP',
+      amount: formatRupiah(order.amount),
+      ref: order.reference || order.id,
+    });
+  } catch {}
   return true;
 }
 
@@ -1340,18 +1431,23 @@ bot.action(/^topup:(\d+)$/, async (ctx) => {
   if (!TOPUP_OPTIONS.includes(nominal)) return ctx.answerCbQuery('Nominal tidak valid.');
   try {
     if (await refuseIfPending(ctx, getChatId(ctx))) return;
-    const qris = await createQris(nominal);
+    // Topup saldo VPS masuk via jalur deposit internal (duit parkir di provider, nokos tetap jalan).
+    // QRIS langsung VPS/panel tetap via jalur utama (createQris) — tidak berubah.
+    let dep = null;
+    try { dep = await createDeposit(nominal, 'qris'); }
+    catch (e) { await ctx.reply(`Gagal bikin QRIS: ${e.message}`); return; }
     const chatId = getChatId(ctx);
     const order = {
       id: randomUUID(),
       kind: 'topup',
+      provider: 'rumahotp',
       chatId,
       buyerName: ctx.from?.first_name || '',
-      reference: qris.reference,
+      reference: dep.id,
       createdAt: Date.now(),
-      expiredAt: qris.expiredAt,
-      total: qris.total,
-      amount: qris.nominal,
+      expiredAt: dep.expired_at,
+      total: dep.total,
+      amount: dep.diterima || nominal,
       status: 'pending',
     };
     const orders = await readJson(ordersFile);
@@ -1360,10 +1456,11 @@ bot.action(/^topup:(\d+)$/, async (ctx) => {
     startPolling(order.id);
 
     const caption =
-      `Top up ${formatRupiah(qris.nominal)} lewat QR di foto ini.\n` +
-      `Bayar ${formatRupiah(qris.total)} (termasuk kode unik).\n\n` +
-      `Reference: ${qris.reference}\n` +
-      qrisExpiryText(qris);
+      `🖥️ Top up Saldo VPS ${formatRupiah(dep.diterima || nominal)} lewat QR di foto ini.\n` +
+      `Bayar ${formatRupiah(dep.total)} (termasuk fee).\n\n` +
+      `Deposit: ${dep.id}\n` +
+      qrisExpiryText({ expiredAt: dep.expired_at });
+    const qris = { image: dep.qr_image, reference: dep.id };
     await sendQrisPhoto(ctx, qris, order, caption);
     await ctx.answerCbQuery();
   } catch (error) {
@@ -1558,6 +1655,14 @@ async function activateNokos(orderId) {
   ).catch(() => {});
   try {
     await notifyAdmins(`📱 Nokos laku!\n👤 ${order.buyerName} (${order.chatId})\n📦 ${order.serviceLabel} ${order.phone}\n💰 ${formatRupiah(order.total)} via ${order.payMethod === 'balance' ? 'SALDO' : 'QRIS'}\nRef: ${order.reference || order.id}`);
+  } catch {}
+  try {
+    await sendTesti('buy', {
+      name: order.buyerName || 'Pembeli',
+      detail: `Nokos ${order.serviceLabel || ''} ${order.phone || ''}`.trim(),
+      amount: formatRupiah(order.total),
+      ref: order.reference || order.id,
+    });
   } catch {}
   return true;
 }
@@ -1856,6 +1961,14 @@ bot.action(/^nbuybal:(\d+)(?::(\d+):([^:]+))?$/, async (ctx) => {
   try {
     await notifyAdmins(`📱 Nokos laku!\n👤 ${order.buyerName} (${chatId})\n📦 ${meta.label} ${ro.phone_number}\n💰 ${formatRupiah(meta.jual)} via SALDO\nRef: ${order.id.slice(0, 8)}`);
   } catch {}
+  try {
+    await sendTesti('buy', {
+      name: order.buyerName || 'Pembeli',
+      detail: `Nokos ${meta.label} ${ro.phone_number}`.trim(),
+      amount: formatRupiah(meta.jual),
+      ref: order.id,
+    });
+  } catch {}
 });
 
 bot.action(/^nkd:(.+)$/, async (ctx) => {
@@ -1913,19 +2026,19 @@ bot.action(/^cancel:(.+)$/, async (ctx) => {
     const order = orders[ctx.match[1]];
     const chatId = getChatId(ctx);
     if (!order || (chatId && order.chatId !== chatId)) return ctx.answerCbQuery('Pesanan tidak ditemukan.');
-    if (order.status === 'delivered' || order.status === 'credited') return ctx.answerCbQuery('Sudah diproses, tidak bisa dibatalkan.');
+    if (order.status === 'delivered' || order.status === 'credited' || order.status === 'paid_panel') return ctx.answerCbQuery('Sudah diproses, tidak bisa dibatalkan.');
     if (order.status === 'cancelled') return ctx.answerCbQuery('Pesanan sudah dibatalkan.');
     if (!order.reference) return ctx.answerCbQuery('Pesanan saldo tidak bisa dibatalkan.');
     // Kalau ternyata sudah bayar, proses daripada dibatalkan
     try {
-      const alreadyPaid = order.kind === 'otp_topup' ? await checkDeposit(order) : await checkPayment(order);
+      const alreadyPaid = (order.kind === 'otp_topup' || order.provider === 'rumahotp') ? await checkDeposit(order) : await checkPayment(order);
       if (alreadyPaid) {
         await verifyAndDeliver(ctx, order.id);
         return;
       }
     } catch {}
     try {
-      if (order.kind === 'otp_topup') {
+      if (order.kind === 'otp_topup' || order.provider === 'rumahotp') {
         if (order.reference) await cancelDeposit(order.reference).catch(() => {});
       } else {
         await cancelPayment(order);
@@ -2055,6 +2168,234 @@ async function forwardToAdmins(ctx, text, replyMsg) {
   else await ctx.reply('❌ Gagal kirim ke admin. Coba lagi nanti.');
 }
 
+// ---- Panel Legal ----
+bot.action('panel_legal', async (ctx) => {
+  try {
+    await ctx.answerCbQuery().catch(() => {});
+    await ctx.reply(panelIntroText(), panelListKeyboard());
+  } catch {
+    await ctx.answerCbQuery('Gagal buka menu panel.').catch(() => {});
+  }
+});
+
+// User klik paket -> minta username (dikunci anti-QR-ganda kayak order lain)
+bot.action(/^pbuy:(.+)$/, async (ctx) => {
+  const plan = panelPlanById(ctx.match[1]);
+  if (!plan) return ctx.answerCbQuery('Paket tidak valid.');
+  const chatId = getChatId(ctx);
+  const dup = await findPendingPayment(chatId);
+  if (dup) {
+    await ctx.answerCbQuery('Kamu masih punya QR aktif.').catch(() => {});
+    await ctx.reply(`⚠️ Bayar QR yang tadi dulu (ref: ${dup.reference}) atau batalkan sebelum bikin baru.`).catch(() => {});
+    return;
+  }
+  await withPayLock(chatId, async () => {
+    panelWaitUsername.set(String(chatId), plan.id);
+    await ctx.answerCbQuery().catch(() => {});
+    await ctx.reply(
+      `📦 Panel ${plan.label} — ${formatRupiah(plan.price)}\n\nSilakan kirim USERNAME panel yang kamu mau (1 pesan, tanpa spasi, contoh: nagato01):\n\nKetik /batal kapan aja buat batalin.`,
+      Markup.inlineKeyboard([[Markup.button.callback('❌ Batal', 'panel_cancel_input')]])
+    );
+  });
+});
+
+bot.action('panel_cancel_input', async (ctx) => {
+  panelWaitUsername.delete(String(getChatId(ctx)));
+  pendingPanelPay.delete(String(getChatId(ctx)));
+  await ctx.answerCbQuery('Dibatalkan.').catch(() => {});
+  await ctx.reply('❌ Input username dibatalkan. Balik ke /start kalau mau mulai lagi.');
+});
+
+bot.command('batal', async (ctx) => {
+  panelWaitUsername.delete(String(getChatId(ctx)));
+  pendingPanelPay.delete(String(getChatId(ctx)));
+  await ctx.reply('❌ Dibatalkan. Balik ke /start kalau mau mulai lagi.');
+});
+
+// Tangkap username -> buatkan QRIS sesuai harga paket
+bot.on('text', async (ctx, next) => {
+  try {
+    const chatKey = String(getChatId(ctx));
+    const text = (ctx.message?.text || '').trim();
+    if (text.startsWith('/')) return next();
+    if (!panelWaitUsername.has(chatKey)) return next();
+    const plan = panelPlanById(panelWaitUsername.get(chatKey));
+    if (!plan) {
+      panelWaitUsername.delete(chatKey);
+      return next();
+    }
+    const username = text.split(/\s+/)[0].slice(0, 32);
+    if (!/^[a-zA-Z0-9_.]{3,32}$/.test(username)) {
+      await ctx.reply('❌ Username 3-32 karakter, huruf/angka/underscore/titik aja. Kirim ulang, atau /batal.');
+      return;
+    }
+    panelWaitUsername.delete(chatKey);
+    const balance = await getBalance(getChatId(ctx));
+    pendingPanelPay.set(chatKey, { planId: plan.id, username });
+    await ctx.reply(
+      `📦 Panel ${plan.label}\n👤 Username: ${username}\n💰 Saldo kamu: ${formatRupiah(balance)}\n\nPilih metode pembayaran ${formatRupiah(plan.price)}:`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback(`📱 Bayar QRIS — ${formatRupiah(plan.price)}`, 'ppay:qris')],
+        [Markup.button.callback(`💰 Bayar pakai Saldo — ${formatRupiah(plan.price)}`, 'ppay:saldo')],
+        [Markup.button.callback('❌ Batal', 'panel_cancel_input')],
+      ])
+    );
+  } catch { try { await next(); } catch {} }
+});
+
+// ---- Eksekusi bayar panel: QRIS vs Saldo ----
+bot.action('ppay:qris', async (ctx) => {
+  const chatKey = String(getChatId(ctx));
+  const pend = pendingPanelPay.get(chatKey);
+  if (!pend) return ctx.answerCbQuery('Pilihan kedaluwarsa. Ulangi dari menu panel.');
+  const plan = panelPlanById(pend.planId);
+  if (!plan) {
+    pendingPanelPay.delete(chatKey);
+    return ctx.answerCbQuery('Paket tidak valid.');
+  }
+  const username = pend.username;
+  pendingPanelPay.delete(chatKey);
+  try {
+    await withPayLock(getChatId(ctx), async () => {
+        const dup = await findPendingPayment(getChatId(ctx));
+        if (dup) {
+          await ctx.reply(`⚠️ Bayar QR yang tadi dulu (ref: ${dup.reference}) atau batalkan sebelum bikin baru.`);
+          return;
+        }
+        const qris = await createQris(plan.price);
+        const order = {
+          id: randomUUID(),
+          kind: 'panel',
+          payMethod: 'qris',
+          chatId: getChatId(ctx),
+          buyerName: ctx.from?.first_name || '',
+          panelId: plan.id,
+          panelLabel: plan.label,
+          panelUsername: username,
+          reference: qris.reference,
+          createdAt: Date.now(),
+          expiredAt: qris.expiredAt,
+          total: qris.total,
+          status: 'pending',
+        };
+        const orders = await readJson(ordersFile);
+        orders[order.id] = order;
+        await writeJson(ordersFile, orders);
+        startPolling(order.id);
+
+        const caption =
+          `🛡️ Panel ${plan.label}\n👤 Username: ${username}\n` +
+          `💰 Bayar ${formatRupiah(qris.total)} (total sudah termasuk fee + kode unik) lewat QR di foto ini.\n\n` +
+          `ID Pembayaran: ${qris.reference}\n` +
+          qrisExpiryText(qris) + `\n\n` +
+          `💡 Panduan Pembayaran:\n` +
+          `1. Scan kode QR di atas\n` +
+          `2. Bayar PAS sesuai nominal total\n` +
+          `3. Kirim Foto Bukti Transfer ke bot ini\n` +
+          `4. Admin akan memproses pesananmu segera\n\n` +
+          `⚠️ Catatan:\n` +
+          `• Simpan ID Pembayaran untuk referensi\n` +
+          `• Transaksi diproses manual oleh Admin\n` +
+          `• Klik tombol di bawah jika ingin membatalkan`;
+        await sendQrisPhoto(ctx, qris, order, caption);
+        await ctx.answerCbQuery().catch(() => {});
+      });
+    } catch (error) {
+      await ctx.answerCbQuery('Gagal membuat QRIS.').catch(() => {});
+      await ctx.reply(`Gagal: ${error.message}`);
+    }
+});
+
+bot.action('ppay:saldo', async (ctx) => {
+  const chatKey = String(getChatId(ctx));
+  const pend = pendingPanelPay.get(chatKey);
+  if (!pend) return ctx.answerCbQuery('Pilihan kedaluwarsa. Ulangi dari menu panel.');
+  const plan = panelPlanById(pend.planId);
+  if (!plan) {
+    pendingPanelPay.delete(chatKey);
+    return ctx.answerCbQuery('Paket tidak valid.');
+  }
+  const username = pend.username;
+  pendingPanelPay.delete(chatKey);
+  const chatId = getChatId(ctx);
+  const buyerName = ctx.from?.first_name || '';
+  const result = await withStockLock(async () => {
+    const users = await readJson(usersFile);
+    const bal = Number(users?.[chatId]?.balance || 0);
+    if (bal < plan.price) return { ok: false, bal };
+    users[chatId] = { ...(users[chatId] || {}), balance: bal - plan.price, name: buyerName || users[chatId]?.name };
+    const orders = await readJson(ordersFile);
+    const order = {
+      id: randomUUID(),
+      kind: 'panel',
+      payMethod: 'balance',
+      chatId,
+      buyerName,
+      panelId: plan.id,
+      panelLabel: plan.label,
+      panelUsername: username,
+      reference: null,
+      createdAt: Date.now(),
+      deliveredAt: Date.now(),
+      total: plan.price,
+      status: 'paid_panel',
+    };
+    orders[order.id] = order;
+    await writeJson(usersFile, users);
+    await writeJson(ordersFile, orders);
+    return { ok: true, order, left: bal - plan.price };
+  });
+  if (!result.ok) {
+    await ctx.answerCbQuery('Saldo kurang.').catch(() => {});
+    await ctx.reply(
+      `💰 Saldo kamu ${formatRupiah(result.bal)}, kurang untuk Panel ${plan.label} (${formatRupiah(plan.price)}). Top up dulu ya.`,
+      Markup.inlineKeyboard([[Markup.button.callback('➕ Top Up Saldo', 'topup')]])
+    ).catch(() => {});
+    return;
+  }
+  await afterPanelPaid(result.order);
+  await ctx.answerCbQuery('Saldo terpotong. Pesanan diproses admin.').catch(() => {});
+});
+
+// User kirim foto bukti TF panel -> teruskan ke admin (dengan konteks order)
+bot.on('photo', async (ctx, next) => {
+  try {
+    const photos = ctx.message?.photo || [];
+    if (!photos.length || ctx.chat?.type !== 'private') return next();
+    let ctxOrder = null;
+    try {
+      const orders = await readJson(ordersFile);
+      const mine = Object.values(orders)
+        .filter((o) => o && o.kind === 'panel' && o.chatId === getChatId(ctx) && (o.status === 'pending' || o.status === 'paid_panel'))
+        .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+      ctxOrder = mine[0] || null;
+    } catch {}
+    if (!ctxOrder) return next(); // bukan bukti panel -> lewatkan (contact/testi flow)
+    const fileId = photos[photos.length - 1].file_id;
+    const from = ctx.from;
+    const buyer = `${from?.first_name || 'User'} (@${from?.username || '-'} | ${ctx.chat?.id})`;
+    const info = `📦 Panel ${ctxOrder.panelLabel} | 👤 ${ctxOrder.panelUsername} | 💰 ${formatRupiah(ctxOrder.total)} | Ref: ${ctxOrder.reference} | Status: ${ctxOrder.status}`;
+    const userCap = (ctx.message?.caption || '').trim();
+    if (!config.adminIds.length) {
+      await ctx.reply('✅ Bukti diterima. Tunggu balasan admin ya 🙏');
+      return;
+    }
+    for (const id of config.adminIds) {
+      try {
+        await bot.telegram.sendPhoto(id, fileId, {
+          caption: `🧾 Bukti TF panel masuk\n👤 ${buyer}\n${info}\n📝 ${userCap || '-'}\n\nBalas pakai:\n/balas ${ctx.chat?.id} <detail panel>`,
+        });
+      } catch (e) {
+        console.error(`Gagal teruskan bukti panel ke admin ${id}:`, e.message);
+      }
+    }
+    await ctx.reply('✅ Bukti diterima. Pembayaran berhasil — pesanan akan diproses, tunggu balasan admin ya 🙏');
+  } catch (e) {
+    console.error('Gagal proses foto bukti panel:', e.message);
+    try { await next(); } catch {}
+  }
+});
+
 // /balas <id_user> <pesan> — admin balas user
 bot.command('balas', async (ctx) => {
   if (!isAdmin(ctx)) return;
@@ -2071,6 +2412,64 @@ bot.command('balas', async (ctx) => {
     await ctx.reply('✅ Balasan terkirim.');
   } catch (e) {
     await ctx.reply(`❌ Gagal kirim: ${e.message}`);
+    return;
+  }
+  // Kalau target punya order panel lunas yang belum ditanya testi,
+  // tawarkan ke buyer: mau kirim testi ke channel apa enggak.
+  try {
+    const orders = await readJson(ordersFile);
+    const cand = Object.values(orders)
+      .filter((o) => o && o.kind === 'panel' && String(o.chatId) === String(target) && o.status === 'paid_panel' && !o.testiAsked)
+      .sort((a, b) => (b.deliveredAt || b.createdAt || 0) - (a.deliveredAt || a.createdAt || 0))[0];
+    if (cand) {
+      cand.testiAsked = true;
+      await writeJson(ordersFile, orders);
+      await bot.telegram.sendMessage(
+        target,
+        `⭐ Panel kamu sudah dikirim admin!\nApakah anda ingin mengirim testi ke channel testimoni? 🙏`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback('✅ Ya, kirim testi', `testi:yes:${cand.id}`)],
+          [Markup.button.callback('❌ Tidak, makasih', `testi:no:${cand.id}`)],
+        ])
+      ).catch(() => {});
+    }
+  } catch {}
+});
+
+// Buyer jawab tawaran testi panel
+bot.action(/^testi:(yes|no):(.+)$/, async (ctx) => {
+  const want = ctx.match[1];
+  const orderId = ctx.match[2];
+  const chatId = getChatId(ctx);
+  try {
+    const orders = await readJson(ordersFile);
+    const order = orders[orderId];
+    if (!order || order.chatId !== chatId || order.kind !== 'panel') {
+      return ctx.answerCbQuery('Order tidak ditemukan.');
+    }
+    if (order.testiSent) {
+      await ctx.answerCbQuery('Testi sudah dikirim.').catch(() => {});
+      return;
+    }
+    if (want === 'no') {
+      order.testiSent = 'declined';
+      await writeJson(ordersFile, orders);
+      await ctx.answerCbQuery('Siap, santai!').catch(() => {});
+      await ctx.reply('Siap, makasih banyak udah order! 🙏').catch(() => {});
+      return;
+    }
+    order.testiSent = true;
+    await writeJson(ordersFile, orders);
+    await sendTesti('buy', {
+      name: order.buyerName || 'Pembeli',
+      detail: `Panel ${order.panelLabel || ''} (${order.panelUsername || ''})`.trim(),
+      amount: formatRupiah(order.total || 0),
+      ref: order.reference || order.id,
+    });
+    await ctx.answerCbQuery('Testi terkirim!').catch(() => {});
+    await ctx.reply('✅ Testi kamu sudah terkirim ke channel. Makasih banyak! ⭐').catch(() => {});
+  } catch {
+    await ctx.answerCbQuery('Gagal proses testi.').catch(() => {});
   }
 });
 
@@ -2347,6 +2746,7 @@ bot.command('riwayat', async (ctx) => {
     const date = o.createdAt ? new Date(o.createdAt).toLocaleString('id-ID') : '-';
     const kind = (o.kind || 'buy') === 'topup' ? 'DEPOSIT'
       : (o.kind === 'nokos' || o.kind === 'nokos_pending') ? `NOKOS ${o.serviceLabel || ''} ${o.phone || ''}`.trim()
+      : o.kind === 'panel' ? `PANEL ${o.panelLabel || ''} (${o.panelUsername || ''})`.trim()
       : `BELI (${o.payMethod || 'qris'})`;
     const amt = formatRupiah(o.kind === 'topup' ? o.amount : o.total);
     return `• ${date}\n  ${kind} ${amt} — ${o.status} — ${(o.buyerName || o.chatId)} — ${(o.reference || o.id || '').toString().slice(0, 18)}`;
