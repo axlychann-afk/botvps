@@ -1546,8 +1546,14 @@ async function countActiveNokos(chatId) {
 }
 
 // Cek stok nomor cukup? Fail-fast sebelum user bayar.
-async function providerReady(butuh) {
+// Cek ganda: saldo provider cukup + stok provider real masih ada (fresh API).
+async function providerReady(butuh, meta = null) {
   try {
+    // 1. kalau meta dibawa, pastikan stok provider itu masih >0 dari data fresh
+    if (meta?.best && Number(meta.best.stock) <= 0) {
+      return { ok: false, balance: 0, reason: 'stok-provider-habis' };
+    }
+    // 2. saldo provider cukup buat modal?
     const b = await otpBalance();
     return { ok: Number(b?.balance || 0) >= Number(butuh || 0), balance: Number(b?.balance || 0) };
   } catch (e) {
@@ -1747,7 +1753,7 @@ bot.action(/^nsvc:(\d+):(\d+)$/, async (ctx) => {
   const serviceId = Number(ctx.match[1]);
   const page = Math.max(0, Number(ctx.match[2]) || 0);
   let rows = [];
-  try { rows = await cachedCountries(serviceId); }
+  try { rows = await cachedCountries(serviceId, page === 0); }
   catch (e) { await ctx.reply(`Gagal ambil negara: ${e.message}`); return; }
   const label = await serviceLabel(serviceId);
   const withPrice = (rows || []).map((r) => ({ r, cheap: countryCheapest(r) })).filter((x) => x.cheap);
@@ -1761,7 +1767,7 @@ bot.action(/^nsvc:(\d+):(\d+)$/, async (ctx) => {
   const p = Math.min(page, total - 1);
   const slice = withPrice.slice(p * NOKOS_PAGE, p * NOKOS_PAGE + NOKOS_PAGE);
   const kb = slice.map(({ r, cheap }) => [Markup.button.callback(
-    `${/indonesia/i.test(r.name || '') ? '🇮🇩' : '🌍'} ${r.name} — ${formatRupiah(sellPrice(cheap.price))} (stok ${r.stock_total})`,
+    `${/indonesia/i.test(r.name || '') ? '🇮🇩' : '🌍'} ${r.name} — ${formatRupiah(sellPrice(cheap.price))} (stok ${cheap.stock})`,
     `nky:${serviceId}:${r.number_id}`
   )]);
   const nav = [];
@@ -1778,7 +1784,7 @@ bot.action(/^nky:(\d+):(\d+)$/, async (ctx) => {
   const serviceId = Number(ctx.match[1]);
   const numberId = Number(ctx.match[2]);
   let rows = [];
-  try { rows = await cachedCountries(serviceId); }
+  try { rows = await cachedCountries(serviceId, true); }
   catch (e) { await ctx.reply(`Gagal ambil stok: ${e.message}`); return; }
   const row = (rows || []).find((r) => Number(r.number_id) === numberId);
   if (!row) { await ctx.reply('Negara tidak ketemu.'); return; }
@@ -1794,7 +1800,7 @@ bot.action(/^nky:(\d+):(\d+)$/, async (ctx) => {
 });
 
 bot.action(/^nk:(\d+)$/, async (ctx) => {
-  await showNokosDetail(ctx, Number(ctx.match[1]), null, null, false);
+  await showNokosDetail(ctx, Number(ctx.match[1]), null, null, true);
 });
 
 bot.action(/^nkrf:(\d+)$/, async (ctx) => {
@@ -1804,7 +1810,7 @@ bot.action(/^nkrf:(\d+)$/, async (ctx) => {
 
 bot.action(/^nkp:(\d+):(\d+):([^:]+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  await showNokosDetail(ctx, Number(ctx.match[1]), Number(ctx.match[2]), String(ctx.match[3]), false);
+  await showNokosDetail(ctx, Number(ctx.match[1]), Number(ctx.match[2]), String(ctx.match[3]), true);
 });
 
 async function showNokosDetail(ctx, serviceId, numberId, providerId, force) {
@@ -1812,9 +1818,11 @@ async function showNokosDetail(ctx, serviceId, numberId, providerId, force) {
   try { meta = await prepareNokosMeta(serviceId, numberId, providerId, force); }
   catch (e) { await ctx.reply(`Gagal: ${e.message}`); return; }
   const tag = `${meta.label} — ${meta.row.name} (${meta.row.prefix})`;
+  const stokReal = Number(meta.best.stock || 0);
+  const stokText = stokReal <= 3 ? `📦 Stok ready: ${stokReal} (menipis, siapa cepat!)\n` : `📦 Stok ready: ${stokReal}\n`;
   await ctx.reply(
     `📱 ${tag}\n` +
-    `📦 Stok: ${meta.best.stock}\n` +
+    stokText +
     `💰 Harga ${formatRupiah(meta.jual)}\n` +
     `⏰ Nomor aktif ${config.nokosTimeoutMinutes} mnt, OTP auto-forward.${force ? '\n🔄 Harga fresh.' : ''}\n\nBayar pakai:`,
     Markup.inlineKeyboard([
@@ -1874,7 +1882,7 @@ bot.action(/^nbuy:(\d+)(?::(\d+):([^:]+))?$/, async (ctx) => {
   let meta = null;
   try { meta = await prepareNokosMeta(args.serviceId, args.numberId, args.providerId); }
   catch (e) { await ctx.reply(`Gagal: ${e.message}`); return; }
-  const ready = await providerReady(meta.best.price);
+  const ready = await providerReady(meta.best.price, meta);
   if (!ready.ok) {
     await ctx.reply(`❌ Stok nomor lagi habis. Jangan bayar dulu — hubungi admin.`);
     await notifyAdmins(`⚠️ NOKOS DITAHAN (QRIS)\n👤 ${ctx.from?.first_name} (${getChatId(ctx)}) mau beli ${meta.label} ${meta.row.name} ${formatRupiah(meta.jual)}.\nStok nomor habis — cek dashboard.`);
@@ -1923,7 +1931,7 @@ bot.action(/^nbuybal:(\d+)(?::(\d+):([^:]+))?$/, async (ctx) => {
     return;
   }
   // Cek stok nomor dulu — jangan potong user kalau stok habis.
-  const ready = await providerReady(meta.best.price);
+  const ready = await providerReady(meta.best.price, meta);
   if (!ready.ok) {
     await ctx.reply(`❌ Stok nomor lagi habis.\n💰 Saldo kamu AMAN, tidak kepotong. Hubungi admin.`);
     await notifyAdmins(`⚠️ NOKOS DITAHAN\n👤 ${ctx.from?.first_name} (${chatId}) mau beli ${meta.label} ${meta.row.name} ${formatRupiah(meta.jual)}.\nStok nomor habis — cek dashboard.`);
