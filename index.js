@@ -1431,23 +1431,22 @@ bot.action(/^topup:(\d+)$/, async (ctx) => {
   if (!TOPUP_OPTIONS.includes(nominal)) return ctx.answerCbQuery('Nominal tidak valid.');
   try {
     if (await refuseIfPending(ctx, getChatId(ctx))) return;
-    // Topup saldo VPS masuk via jalur deposit internal (duit parkir di provider, nokos tetap jalan).
-    // QRIS langsung VPS/panel tetap via jalur utama (createQris) — tidak berubah.
-    let dep = null;
-    try { dep = await createDeposit(nominal, 'qris'); }
+    // Topup saldo VPS via QRIS utama (austinstore) — TIDAK via RumahOTP.
+    // Khusus nokos (nbuy/topup_otp) yang via deposit RumahOTP biar pool provider keisi.
+    let qris = null;
+    try { qris = await createQris(nominal); }
     catch (e) { await ctx.reply(`Gagal bikin QRIS: ${e.message}`); return; }
     const chatId = getChatId(ctx);
     const order = {
       id: randomUUID(),
       kind: 'topup',
-      provider: 'rumahotp',
       chatId,
       buyerName: ctx.from?.first_name || '',
-      reference: dep.id,
+      reference: qris.reference,
       createdAt: Date.now(),
-      expiredAt: dep.expired_at,
-      total: dep.total,
-      amount: dep.diterima || nominal,
+      expiredAt: qris.expiredAt,
+      total: qris.total,
+      amount: qris.nominal,
       status: 'pending',
     };
     const orders = await readJson(ordersFile);
@@ -1456,11 +1455,10 @@ bot.action(/^topup:(\d+)$/, async (ctx) => {
     startPolling(order.id);
 
     const caption =
-      `🖥️ Top up Saldo VPS ${formatRupiah(dep.diterima || nominal)} lewat QR di foto ini.\n` +
-      `Bayar ${formatRupiah(dep.total)} (termasuk fee).\n\n` +
-      `Deposit: ${dep.id}\n` +
-      qrisExpiryText({ expiredAt: dep.expired_at });
-    const qris = { image: dep.qr_image, reference: dep.id };
+      `🖥️ Top up Saldo VPS ${formatRupiah(qris.nominal)} lewat QR di foto ini.\n` +
+      `Bayar ${formatRupiah(qris.total)} (termasuk fee).\n\n` +
+      `Reference: ${qris.reference}\n` +
+      qrisExpiryText(qris);
     await sendQrisPhoto(ctx, qris, order, caption);
     await ctx.answerCbQuery();
   } catch (error) {
@@ -1555,10 +1553,22 @@ async function providerReady(butuh, meta = null) {
     }
     // 2. saldo provider cukup buat modal?
     const b = await otpBalance();
-    return { ok: Number(b?.balance || 0) >= Number(butuh || 0), balance: Number(b?.balance || 0) };
+    const bal = Number(b?.balance || 0);
+    if (bal < Number(butuh || 0)) {
+      return { ok: false, balance: bal, reason: 'saldo-provider-habis' };
+    }
+    return { ok: true, balance: bal };
   } catch (e) {
     return { ok: false, balance: 0, error: e.message };
   }
+}
+
+function nokosBlockedMsg(ready, meta) {
+  if (ready?.reason === 'saldo-provider-habis') {
+    return `❌ Saldo provider lagi Rp${Number(ready.balance || 0).toLocaleString('id-ID')} (butuh ${formatRupiah(meta?.best?.price)} buat modal).\n` +
+      `Bukan stok ${meta?.best?.stock} yang habis — tapi saldo RumahOTP kosong.\nJangan bayar dulu — hubungi admin buat topup deposit.`;
+  }
+  return `❌ Stok nomor lagi habis. Jangan bayar dulu — hubungi admin.`;
 }
 
 function nokosButtons(orderId) {
@@ -1824,10 +1834,10 @@ async function showNokosDetail(ctx, serviceId, numberId, providerId, force) {
     `📱 ${tag}\n` +
     stokText +
     `💰 Harga ${formatRupiah(meta.jual)}\n` +
-    `⏰ Nomor aktif ${config.nokosTimeoutMinutes} mnt, OTP auto-forward.${force ? '\n🔄 Harga fresh.' : ''}\n\nBayar pakai:`,
+    `⏰ Nomor aktif ${config.nokosTimeoutMinutes} mnt, OTP auto-forward.${force ? '\n🔄 Harga fresh.' : ''}\n\nWajib topup saldo OTP dulu, bayarnya pakai saldo:`,
     Markup.inlineKeyboard([
-      [Markup.button.callback(`🛒 QRIS ${formatRupiah(meta.jual)}`, `nbuy:${serviceId}:${meta.row.number_id}:${meta.best.provider_id}`)],
-      [Markup.button.callback(`💰 Saldo ${formatRupiah(meta.jual)}`, `nbuybal:${serviceId}:${meta.row.number_id}:${meta.best.provider_id}`)],
+      [Markup.button.callback(`💰 Beli pakai Saldo ${formatRupiah(meta.jual)}`, `nbuybal:${serviceId}:${meta.row.number_id}:${meta.best.provider_id}`)],
+      [Markup.button.callback('📱 Top Up Saldo OTP', 'topup_otp')],
       [Markup.button.callback('🔄 Refresh harga', `nkrfp:${serviceId}:${meta.row.number_id}:${meta.best.provider_id}`)],
     ])
   );
@@ -1872,44 +1882,14 @@ function parseBuyArgs(m) {
 
 bot.action(/^nbuy:(\d+)(?::(\d+):([^:]+))?$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  if (!(await isJoinedTesti(ctx.from.id))) { await ctx.reply(`⚠️ Gabung dulu:\n👉 ${config.testiLink}`, joinGateButtons()).catch(() => {}); return; }
-  if ((await countActiveNokos(getChatId(ctx))) >= config.nokosMaxActive) {
-    await ctx.reply(`❌ Kamu sudah pegang max ${config.nokosMaxActive} nokos aktif. Selesaikan/batalkan dulu.`);
-    return;
-  }
-  await withPayLock(getChatId(ctx), async () => {
-  const args = parseBuyArgs(ctx.match);
-  let meta = null;
-  try { meta = await prepareNokosMeta(args.serviceId, args.numberId, args.providerId); }
-  catch (e) { await ctx.reply(`Gagal: ${e.message}`); return; }
-  const ready = await providerReady(meta.best.price, meta);
-  if (!ready.ok) {
-    await ctx.reply(`❌ Stok nomor lagi habis. Jangan bayar dulu — hubungi admin.`);
-    await notifyAdmins(`⚠️ NOKOS DITAHAN (QRIS)\n👤 ${ctx.from?.first_name} (${getChatId(ctx)}) mau beli ${meta.label} ${meta.row.name} ${formatRupiah(meta.jual)}.\nStok nomor habis — cek dashboard.`);
-    return;
-  }
-  let qris = null;
-  if (await refuseIfPending(ctx, getChatId(ctx))) return;
-  try { qris = await createQris(meta.jual); }
-  catch (e) { await ctx.reply(`Gagal bikin QRIS: ${e.message}`); return; }
-  const chatId = getChatId(ctx);
-  const order = {
-    id: randomUUID(), kind: 'nokos_pending', payMethod: 'qris',
-    chatId, buyerName: ctx.from?.first_name || '',
-    reference: qris.reference, createdAt: Date.now(), expiredAt: qris.expiredAt,
-    total: qris.total, amount: qris.nominal, status: 'pending',
-    serviceId: args.serviceId, serviceLabel: meta.label,
-    countryLabel: meta.row.name || 'Indonesia',
-    numberId: meta.row.number_id, providerId: String(meta.best.provider_id), operatorId: meta.operatorId,
-    modal: meta.best.price, jual: meta.jual,
-  };
-  const orders = await readJson(ordersFile);
-  orders[order.id] = order;
-  await writeJson(ordersFile, orders);
-  startPolling(order.id);
-  await sendQrisPhoto(ctx, qris, order,
-    `📱 Nokos ${meta.label} ${meta.row.name} — bayar ${formatRupiah(qris.total)} lewat QR ini.\nNomor diorder OTOMATIS setelah bayar.\n\nReference: ${qris.reference}\n${qrisExpiryText(qris)}`);
-  });
+  // QRIS nokos DIMATIKAN: wajib topup saldo OTP dulu, bayar pakai saldo.
+  // (QRIS langsung tidak mengisi pool RumahOTP.)
+  await ctx.reply(
+    `⚠️ QRIS langsung untuk nokos dimatikan.\n` +
+    `Top Up Saldo OTP dulu, lalu beli pakai saldo ya.`,
+    Markup.inlineKeyboard([[Markup.button.callback('📱 Top Up Saldo OTP', 'topup_otp')]])
+  );
+  return;
 });
 
 bot.action(/^nbuybal:(\d+)(?::(\d+):([^:]+))?$/, async (ctx) => {
@@ -1933,8 +1913,8 @@ bot.action(/^nbuybal:(\d+)(?::(\d+):([^:]+))?$/, async (ctx) => {
   // Cek stok nomor dulu — jangan potong user kalau stok habis.
   const ready = await providerReady(meta.best.price, meta);
   if (!ready.ok) {
-    await ctx.reply(`❌ Stok nomor lagi habis.\n💰 Saldo kamu AMAN, tidak kepotong. Hubungi admin.`);
-    await notifyAdmins(`⚠️ NOKOS DITAHAN\n👤 ${ctx.from?.first_name} (${chatId}) mau beli ${meta.label} ${meta.row.name} ${formatRupiah(meta.jual)}.\nStok nomor habis — cek dashboard.`);
+    await ctx.reply(`${nokosBlockedMsg(ready, meta)}\n💰 Saldo kamu AMAN, tidak kepotong.`);
+    await notifyAdmins(`⚠️ NOKOS DITAHAN\n👤 ${ctx.from?.first_name} (${chatId}) mau beli ${meta.label} ${meta.row.name} ${formatRupiah(meta.jual)}.\nPenyebab: ${ready.reason || 'unknown'} — saldo provider ${formatRupiah(ready.balance)} / modal ${formatRupiah(meta.best.price)} / stok provider ${meta.best.stock}.\nSolusi: /nokosaldo lalu topup deposit RumahOTP.`);
     return;
   }
   // Ambil nomor DULU, potong saldo user KALAU sukses. Urutan ini anti-rugi.
