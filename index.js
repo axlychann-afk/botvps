@@ -1449,6 +1449,34 @@ function menuCaption(name, balance, otpBal, remaining, total, percent, dot, empt
   ).slice(0, 1000);
 }
 
+const START_VIDEO_URL = process.env.START_VIDEO_URL || 'https://files.catbox.moe/xhuon5.mp4';
+
+// Menu /start: video dulu, fallback foto spek, fallback teks.
+async function sendStartMenu(ctx, name, chatId) {
+  const { text, buttons } = await buildStart(name, chatId);
+  const remaining = await getStockCount();
+  const balance = chatId ? await getBalance(chatId) : 0;
+  const otpBal = chatId ? await getOtpBalance(chatId) : 0;
+  const total = config.stockTotal > 0 ? config.stockTotal : Math.max(remaining, 1);
+  const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
+  const dot = remaining < 1 ? '🔴' : percent < 30 ? '🟡' : '🟢';
+  const caption = menuCaption(name, balance, otpBal, remaining, total, percent, dot, remaining < 1);
+  if (START_VIDEO_URL) {
+    try {
+      await ctx.replyWithVideo({ url: START_VIDEO_URL }, { caption, ...buttons });
+      return;
+    } catch {}
+  }
+  const photo = await specPhoto();
+  if (photo) {
+    try {
+      await ctx.replyWithPhoto({ source: photo }, { caption, ...buttons });
+      return;
+    } catch {}
+  }
+  await ctx.reply(text, buttons);
+}
+
 bot.start(async (ctx) => {
   // DROP duplikat: /start ganda dalam 5 detik = kirim 1 menu aja
   if (isDoubleStart(ctx.from?.id)) return;
@@ -1466,23 +1494,7 @@ bot.start(async (ctx) => {
     );
     return;
   }
-  const { text, buttons } = await buildStart(name, chatId);
-  // Gabung: 1 pesan foto (kartu spek) + caption menu + tombol. Fallback teks bila render gagal.
-  const photo = await specPhoto();
-  if (photo) {
-    const remaining = await getStockCount();
-  const balance = chatId ? await getBalance(chatId) : 0;
-  const otpBal = chatId ? await getOtpBalance(chatId) : 0;
-    const total = config.stockTotal > 0 ? config.stockTotal : Math.max(remaining, 1);
-    const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
-    const dot = remaining < 1 ? '🔴' : percent < 30 ? '🟡' : '🟢';
-    await ctx.replyWithPhoto({ source: photo }, {
-      caption: menuCaption(name, balance, otpBal, remaining, total, percent, dot, remaining < 1),
-      ...buttons,
-    }).catch(async () => { await ctx.reply(text, buttons); });
-    return;
-  }
-  await ctx.reply(text, buttons);
+  await sendStartMenu(ctx, name, chatId);
 });
 
 bot.action('cek_stok', async (ctx) => {
@@ -2351,22 +2363,7 @@ bot.action('cek_join', async (ctx) => {
   }
   await ctx.answerCbQuery('✅ Terima kasih sudah gabung!');
   const name = ctx.from?.first_name || 'kak';
-  const { text, buttons } = await buildStart(name, getChatId(ctx));
-  const photo = await specPhoto();
-  if (photo) {
-    const remaining = await getStockCount();
-    const balance = await getBalance(getChatId(ctx));
-    const otpBal = await getOtpBalance(getChatId(ctx));
-    const total = config.stockTotal > 0 ? config.stockTotal : Math.max(remaining, 1);
-    const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
-    const dot = remaining < 1 ? '🔴' : percent < 30 ? '🟡' : '🟢';
-    await ctx.replyWithPhoto({ source: photo }, {
-      caption: menuCaption(name, balance, otpBal, remaining, total, percent, dot, remaining < 1),
-      ...buttons,
-    }).catch(async () => { await ctx.reply(text, buttons); });
-    return;
-  }
-  await ctx.reply(text, buttons);
+  await sendStartMenu(ctx, name, getChatId(ctx));
 });
 
 // ---- Contact Admin ----
