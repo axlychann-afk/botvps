@@ -1573,7 +1573,7 @@ async function dropMsg(ctx, m) {
 // Caption di-refresh tiap 3 detik (stat gerak sendiri, 2 menit pertama).
 // Fallback teks bila video gagal.
 const lastMenu = new Map(); // chatKey -> { chat, mid, kind: 'video' | 'text' }
-function startMenuRefresh(chatId, cid, mid, name, buttons) {
+function startMenuRefresh(chatId, cid, mid, name, buttons, kind = 'video') {
   try {
     let ticks = 0, fails = 0;
     const timer = setInterval(async () => {
@@ -1581,9 +1581,13 @@ function startMenuRefresh(chatId, cid, mid, name, buttons) {
       if (ticks > 40) { clearInterval(timer); return; } // 40x3 dtk = 2 menit
       try {
         const fresh = await buildStart(name, chatId);
-        await bot.telegram.editMessageCaption(cid, mid, undefined, fresh.text.slice(0, 1024), {
-          ...buttons,
-        });
+        if (kind === 'text') {
+          await bot.telegram.editMessageText(cid, mid, undefined, fresh.text, { ...buttons });
+        } else {
+          await bot.telegram.editMessageCaption(cid, mid, undefined, fresh.text.slice(0, 1024), {
+            ...buttons,
+          });
+        }
         fails = 0;
       } catch (e) {
         if (String(e?.message || '').includes('not modified')) return; // angka kebetulan sama, lanjut
@@ -1643,11 +1647,15 @@ async function sendStartMenu(ctx, name, chatId) {
   if (prevText && prevText.kind === 'text') {
     try {
       await ctx.telegram.editMessageText(prevText.chat, prevText.mid, undefined, text, { ...buttons });
+      startMenuRefresh(chatId, prevText.chat, prevText.mid, name, buttons, 'text');
       return;
     } catch {}
   }
   const sentText = await ctx.reply(text, buttons).catch(() => null);
-  if (sentText?.message_id) lastMenu.set(key, { chat: sentText.chat.id, mid: sentText.message_id, kind: 'text' });
+  if (sentText?.message_id) {
+    lastMenu.set(key, { chat: sentText.chat.id, mid: sentText.message_id, kind: 'text' });
+    startMenuRefresh(chatId, sentText.chat.id, sentText.message_id, name, buttons, 'text');
+  }
 }
 
 bot.start(async (ctx) => {
@@ -1688,14 +1696,19 @@ bot.action('cek_stok', async (ctx) => {
       try {
         if (prev.kind === 'video') {
           await ctx.telegram.editMessageCaption(prev.chat, prev.mid, undefined, text.slice(0, 1024), { ...buttons });
+          startMenuRefresh(chatId, prev.chat, prev.mid, name, buttons, 'video');
         } else {
           await ctx.telegram.editMessageText(prev.chat, prev.mid, undefined, text, { ...buttons });
+          startMenuRefresh(chatId, prev.chat, prev.mid, name, buttons, 'text');
         }
         return;
       } catch {}
     }
     const sent = await ctx.reply(text, buttons);
-    if (sent?.message_id) lastMenu.set(String(chatId), { chat: sent.chat.id, mid: sent.message_id, kind: 'text' });
+    if (sent?.message_id) {
+      lastMenu.set(String(chatId), { chat: sent.chat.id, mid: sent.message_id, kind: 'text' });
+      startMenuRefresh(chatId, sent.chat.id, sent.message_id, name, buttons, 'text');
+    }
   } catch {
     await ctx.answerCbQuery('Gagal cek stok.');
   }
