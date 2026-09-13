@@ -1369,7 +1369,6 @@ async function buildStart(name, chatId) {
   const dot = empty ? '🔴' : percent < 30 ? '🟡' : '🟢';
   const specLines = config.vpsSpecs.map((s) => `• ${s}`).join('\n');
   const liveBits = [
-    stockOs || null,
     stockPing === null ? null : `Ping VPS ${stockPing}ms`,
     ping === null ? null : `Ping Bot ${ping}ms`,
   ].filter(Boolean).join('  •  ');
@@ -1383,13 +1382,12 @@ async function buildStart(name, chatId) {
     `${specLines ? specLines + '\n' : ''}` +
     `${liveBits ? liveBits + '\n' : ''}` +
     `────────────────\n` +
-    `Kenapa order di sini:\n` +
-    `• Server Xeon E5-2690 v4, 16 threads, RAM 62.88 GB\n` +
-    `• Uptime 18 hari+ nonstop\n` +
+    `✨ Kenapa order di sini:\n` +
+    `• Uptime 24/7\n` +
     `• Auto-order, data langsung dikirim setelah bayar\n` +
     `• Testimoni real di channel\n` +
     `────────────────\n` +
-    `Spek Host:\n` +
+    `🖥️ Spek Host Dari Salah Satu VPS NAT:\n` +
     `• OS: linux (x64)\n` +
     `• Kernel: 5.15.0-190-generic\n` +
     `• CPU: Xeon E5-2690 v4 @ 2.60GHz\n` +
