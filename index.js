@@ -5,6 +5,7 @@ import { constants } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID, createHmac } from 'node:crypto';
+import os from 'node:os';
 import {
   balance as otpBalance,
   cachedServices,
@@ -1315,6 +1316,42 @@ function formatRupiah(n) {
   return `Rp${Number(n ?? PRICE).toLocaleString('id-ID')}`;
 }
 
+// ---- Stat live mesin bot (CPU/RAM/uptime gerak tiap /start) ----
+function fmtGB(bytes) {
+  return `${(Number(bytes || 0) / 1e9).toFixed(2)} GB`;
+}
+function fmtUptime(sec) {
+  sec = Math.max(0, Math.floor(Number(sec) || 0));
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const parts = [];
+  if (d) parts.push(`${d} hari`);
+  if (h) parts.push(`${h} jam`);
+  parts.push(`${m} menit`);
+  return parts.join(', ');
+}
+function cpuSnapshot() {
+  let idle = 0, total = 0;
+  for (const c of os.cpus()) {
+    idle += c.times.idle;
+    total += c.times.user + c.times.nice + c.times.sys + c.times.idle + c.times.irq;
+  }
+  return { idle, total };
+}
+async function cpuPercent(ms = 250) {
+  try {
+    const a = cpuSnapshot();
+    await new Promise((s) => setTimeout(s, ms));
+    const b = cpuSnapshot();
+    const dTotal = b.total - a.total;
+    if (dTotal <= 0) return null;
+    return Math.round((1 - (b.idle - a.idle) / dTotal) * 100);
+  } catch {
+    return null;
+  }
+}
+
 async function getStockCount() {
   try {
     const stock = await readJson(stockFile);
@@ -1372,6 +1409,19 @@ async function buildStart(name, chatId) {
     stockPing === null ? null : `Ping VPS ${stockPing}ms`,
     ping === null ? null : `Ping Bot ${ping}ms`,
   ].filter(Boolean).join('  •  ');
+  // Stat live mesin bot: CPU % (sampling 250ms), RAM, uptime — berubah tiap /start.
+  let hostOs = null, hostKernel = null, hostCpu = null, hostRam = null, hostUp = null;
+  try {
+    hostOs = `${os.platform()} (${os.arch()})`;
+    hostKernel = String(os.release() || '');
+    const model = (os.cpus()?.[0]?.model || '').trim().replace(/\s+/g, ' ');
+    const use = await cpuPercent(250);
+    hostCpu = `${model || 'CPU'}${use === null ? '' : ` — ${use}%`}`;
+    const totalMem = os.totalmem(), usedMem = totalMem - os.freemem();
+    const pct = totalMem > 0 ? Math.round((usedMem / totalMem) * 100) : 0;
+    hostRam = `${fmtGB(usedMem)} / ${fmtGB(totalMem)} (${pct}%)`;
+    hostUp = fmtUptime(os.uptime());
+  } catch {}
   const text =
     `${config.shopName}\n` +
     `Halo, ${name}!\n` +
@@ -1387,11 +1437,12 @@ async function buildStart(name, chatId) {
     `• Auto-order, data langsung dikirim setelah bayar\n` +
     `• Testimoni real di channel\n` +
     `────────────────\n` +
-    `🖥️ Spek Host Dari Salah Satu VPS NAT:\n` +
-    `• OS: linux (x64)\n` +
-    `• Kernel: 5.15.0-190-generic\n` +
-    `• CPU: Xeon E5-2690 v4 @ 2.60GHz\n` +
-    `• Disk: 342.9 GB\n` +
+    `🖥️ Spek Host Live:\n` +
+    (hostOs ? `• OS: ${hostOs}\n` : ``) +
+    (hostKernel ? `• Kernel: ${hostKernel}\n` : ``) +
+    (hostCpu ? `• CPU: ${hostCpu}\n` : ``) +
+    (hostRam ? `• RAM: ${hostRam}\n` : ``) +
+    (hostUp ? `• Uptime: ${hostUp}\n` : ``) +
     `────────────────\n` +
     `Stok ${dot} ${remaining}/${total} ${stockBar(percent)} ${percent}%\n` +
     (empty ? `Stok habis, coba lagi nanti ya kak.\n` : ``) +
@@ -1413,13 +1464,13 @@ async function specPhoto() {
   const sharp = await getSharp();
   if (!sharp) return null;
   try {
-    let stock = 0, os = null, pingVps = null;
+    let stock = 0, stockOsName = null, pingVps = null;
     try {
       const s = await readJson(stockFile);
       stock = Array.isArray(s) ? s.length : 0;
       const first = Array.isArray(s) ? s.find((v) => v && v.ip) : null;
       if (first) {
-        os = first.os || null;
+        stockOsName = first.os || null;
         const p0 = Date.now();
         const sock = (await import('node:net')).default;
         await new Promise((resolve) => {
@@ -1432,13 +1483,13 @@ async function specPhoto() {
       }
     } catch {}
     const rows = {
-      os: os || 'linux (x64)',
-      host: 'VPS NAT Store',
-      kernel: '5.15.0-190-generic',
-      cpu: 'Xeon E5-2690 v4 (16)',
-      ram: '62.88 GB',
-      disk: '342.9 GB',
-      uptime: '18+ hari nonstop',
+      os: stockOsName || (os.platform() + ' (' + os.arch() + ')'),
+      host: config.shopName,
+      kernel: String(os.release() || '-'),
+      cpu: ((os.cpus()?.[0]?.model || 'CPU').trim().replace(/\s+/g, ' ').slice(0, 30)),
+      ram: fmtGB(os.totalmem()),
+      disk: 'SSD',
+      uptime: fmtUptime(os.uptime()),
     };
     return await sharp(Buffer.from(specSvg({ rows, pingVps, pingBot: null, stock }))).png().toBuffer();
   } catch (e) { console.error('Gagal bikin kartu spek:', e.message); return null; }
@@ -1462,12 +1513,13 @@ function menuCaption(name, balance, otpBal, remaining, total, percent, dot, empt
 const START_VIDEO_URL = process.env.START_VIDEO_URL || 'https://files.catbox.moe/sausq2.mp4';
 
 // Menu /start: video 960x600 + teks LENGKAP + tombol, 1 pesan.
+// Caption di-refresh tiap 3 detik (stat gerak sendiri, 2 menit pertama).
 // Fallback teks bila video gagal.
 async function sendStartMenu(ctx, name, chatId) {
   const { text, buttons } = await buildStart(name, chatId);
   if (START_VIDEO_URL) {
     try {
-      await ctx.replyWithVideo(
+      const sent = await ctx.replyWithVideo(
         { url: START_VIDEO_URL },
         {
           caption: text.slice(0, 1024),
@@ -1475,6 +1527,30 @@ async function sendStartMenu(ctx, name, chatId) {
           ...buttons,
         }
       );
+      try {
+        const mid = sent?.message_id;
+        const cid = sent?.chat?.id ?? chatId;
+        if (mid && cid) {
+          let ticks = 0, fails = 0;
+          const timer = setInterval(async () => {
+            ticks++;
+            if (ticks > 40) { clearInterval(timer); return; } // 40x3 dtk = 2 menit
+            try {
+              const fresh = await buildStart(name, chatId);
+              await ctx.telegram.editMessageCaption(cid, mid, undefined, fresh.text.slice(0, 1024), {
+                ...buttons,
+              });
+              fails = 0;
+            } catch (e) {
+              if (String(e?.message || '').includes('not modified')) return; // angka kebetulan sama, lanjut
+              if (++fails >= 3) clearInterval(timer); // dihapus / error beneran -> stop
+            }
+          }, 3000);
+          if (timer && typeof timer.unref === 'function') {
+            try { timer.unref(); } catch {}
+          }
+        }
+      } catch {}
       return;
     } catch {}
   }
