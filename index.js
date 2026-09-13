@@ -1585,6 +1585,20 @@ function videoCaption(fullText) {
 }
 
 const START_VIDEO_URL = process.env.START_VIDEO_URL || 'https://files.catbox.moe/sausq2.mp4';
+// Circuit breaker video: kalau catbox 2x gagal beruntun, skip video
+// untuk 10 menit ke depan -> menu teks langsung muncul (<2 dtk),
+// user ga dikira "menu ga muncul" gara-gara nunggu video mati.
+let videoDeadUntil = 0;
+let videoFails = 0;
+function videoDown() {
+  videoFails++;
+  if (videoFails >= 2) {
+    videoDeadUntil = Date.now() + 10 * 60_000;
+    console.error('Video START mati 2x beruntun — pakai menu teks 10 menit.');
+  }
+}
+function videoOk() { videoFails = 0; }
+function videoAlive() { return !START_VIDEO_URL || Date.now() >= videoDeadUntil; }
 
 // Menu /start: video + teks lengkap + tombol.
 // /start BERULANG ngedit pesan yang sama (command user ga diapa-apain).
@@ -1609,7 +1623,7 @@ function stopMenuRefresh(key) {
 async function resendMenu(chatId, name) {
   const key = String(chatId);
   const { text, buttons } = await buildStart(name, chatId, { elapsedSec: 0, totalSec: 120 });
-  if (START_VIDEO_URL) {
+  if (START_VIDEO_URL && videoAlive()) {
     try {
       const sent = await Promise.race([
         bot.telegram.sendVideo(
@@ -1620,10 +1634,15 @@ async function resendMenu(chatId, name) {
         new Promise((_, rej) => setTimeout(() => rej(new Error('video-timeout')), 10000)),
       ]);
       if (sent?.message_id) {
+        videoOk();
         lastMenu.set(key, { chat: sent.chat.id, mid: sent.message_id, kind: 'video', text });
         return;
       }
-    } catch {}
+      console.error('resendMenu: sent video kosong.');
+    } catch (e) {
+      console.error('resendMenu video gagal:', e?.message || e);
+      videoDown();
+    }
   }
   const sentText = await bot.telegram.sendMessage(chatId, text, { ...buttons });
   if (sentText?.message_id) lastMenu.set(key, { chat: sentText.chat.id, mid: sentText.message_id, kind: 'text', text });
@@ -1765,7 +1784,7 @@ async function sendStartMenu(ctx, name, chatId) {
       // Edit gagal (pesan dihapus / terlalu tua) -> lanjut kirim baru di bawah.
     }
   }
-  if (START_VIDEO_URL) {
+  if (START_VIDEO_URL && videoAlive()) {
     try {
       const sent = await Promise.race([
         ctx.replyWithVideo(
@@ -1780,16 +1799,19 @@ async function sendStartMenu(ctx, name, chatId) {
         new Promise((_, rej) => setTimeout(() => rej(new Error('video-timeout')), 10000)),
       ]);
       if (sent?.message_id) {
+        videoOk();
         // Hapus menu atas yang yatim biar cuma 1 menu — obat "yang atas yang ke-edit".
         if (prev && prev.mid && prev.mid !== sent.message_id) {
           try { await ctx.telegram.deleteMessage(prev.chat, prev.mid); } catch {}
         }
         lastMenu.set(key, { chat: sent.chat.id, mid: sent.message_id, kind: 'video', text, gen: myGen });
         startMenuRefresh(chatId, name);
+        return;
       }
-      return;
+      console.error('kirim video menu: sent kosong, fallback teks.');
     } catch (e) {
       console.error('kirim video menu gagal, fallback teks:', e?.message || e);
+      videoDown();
     }
   }
   try {
@@ -1808,12 +1830,17 @@ async function sendStartMenu(ctx, name, chatId) {
 
 bot.start(async (ctx) => {
   // DROP duplikat: /start ganda dalam 5 detik = kirim 1 menu aja
-  if (isDoubleStart(ctx.from?.id)) return;
+  if (isDoubleStart(ctx.from?.id)) {
+    console.log(`/start dobel dari ${ctx.from?.id} dibuang (5 dtk).`);
+    return;
+  }
   const name = ctx.from?.first_name || 'kak';
   const chatId = getChatId(ctx);
+  console.log(`/start dari ${ctx.from?.id} (${name}) chat=${chatId}`);
   // GATE: wajib gabung GB Testimoni dulu sebelum menu utama muncul
   const joined = await isJoinedTesti(ctx.from.id);
   if (!joined) {
+    console.log(`user ${ctx.from?.id} ketahan gate testimoni.`);
     await ctx.reply(
       `Halo, ${name}! 👋\n\n` +
       `Sebelum bisa order, kamu WAJIB gabung dulu ke GB Testimoni kami:\n` +
@@ -3577,6 +3604,28 @@ if (process.argv.includes('--dry-run')) {
     process.exit(0);
   } catch (e) {
     console.error('DRY-RUN GAGAL:', e?.message || e);
+    process.exit(1);
+  }
+}
+
+// ---- Live-test: kirim 1 pesan tes via API, TANPA polling ----
+// Cara: node index.js --live-test <chat_id>
+// Aman dari 409 Conflict (ga pakai getUpdates). Buktiin token + jaringan + send.
+// Hapus pesan tesnya manual di Telegram kalau mau bersih.
+if (process.argv.includes('--live-test')) {
+  const target = String(process.argv[process.argv.indexOf('--live-test') + 1] || config.adminIds[0] || '').trim();
+  if (!target) {
+    console.error('LIVE-TEST: kasih chat_id. Contoh: node index.js --live-test 123456789');
+    process.exit(1);
+  }
+  try {
+    const me = await bot.telegram.getMe();
+    console.log(`LIVE-TEST: token OK, bot=@${me.username} id=${me.id}`);
+    const sent = await bot.telegram.sendMessage(target, `🔧 live-test OK ${new Date().toISOString()}\nToken + kirim jalan. Kalau ini masuk, /start yang macet bukan soal token.`);
+    console.log(`LIVE-TEST: pesan masuk ke ${target}, message_id=${sent?.message_id}`);
+    process.exit(0);
+  } catch (e) {
+    console.error('LIVE-TEST GAGAL:', e?.message || e);
     process.exit(1);
   }
 }
