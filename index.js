@@ -1544,14 +1544,19 @@ async function randomPackSticker() {
   }
 }
 async function sendStartSticker(ctx) {
+  // Stiker TIDAK BOLEH nahan menu: semua dibatasi 10 dtk.
+  const race10 = (p) => Promise.race([
+    p,
+    new Promise((_, rej) => setTimeout(() => rej(new Error('sticker-timeout')), 10000)),
+  ]);
   try {
-    const fid = await randomPackSticker();
-    if (fid) return await ctx.replyWithSticker(fid);
+    const fid = await race10(randomPackSticker());
+    if (fid) return await race10(ctx.replyWithSticker(fid));
   } catch {}
   const url = process.env.START_STICKER_URL || '';
   if (!url) return null;
   try {
-    return await ctx.replyWithSticker({ url });
+    return await race10(ctx.replyWithSticker({ url }));
   } catch {
     return null;
   }
