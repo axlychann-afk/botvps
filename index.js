@@ -410,13 +410,65 @@ async function notifyAdmins(text) {
 }
 
 async function getBalance(chatId) {
+  // SATU KANTONG: saldo utama + sisa legacy OTP digabung.
+  // Semua pembelian (VPS, panel, nokos) motong dari sini.
   try {
     const users = await readJson(usersFile);
-    return Number(users?.[chatId]?.balance || 0);
+    const u = users?.[chatId] || {};
+    return Number(u.balance || 0) + Number(u.nokosBalance || 0);
   } catch {
     return 0;
   }
 }
+
+// Potong saldo gabungan. Sisa legacy OTP ikut kepakai, hasil tulis di `balance`.
+async function takeBalance(chatId, amount, buyerName) {
+  const users = await readJson(usersFile);
+  const u = users[chatId] || {};
+  const total = Number(u.balance || 0) + Number(u.nokosBalance || 0);
+  if (total < amount) return { ok: false, bal: total };
+  users[chatId] = { ...u, balance: total - amount, nokosBalance: 0, name: buyerName || u.name };
+  await writeJson(usersFile, users);
+  return { ok: true, bal: total - amount };
+}
+
+// Tambah saldo gabungan (topup VPS via Austin / topup OTP via RumahOTP
+// dua-duanya masuk ke 1 dompet ini). Legacy OTP ikut dilipat.
+async function addBalance(chatId, amount, buyerName) {
+  const users = await readJson(usersFile);
+  const u = users[chatId] || {};
+  const total = Number(u.balance || 0) + Number(u.nokosBalance || 0) + Number(amount || 0);
+  users[chatId] = { ...u, balance: total, nokosBalance: 0, name: buyerName || u.name };
+  await writeJson(usersFile, users);
+  return total;
+}
+
+// Batas + parser nominal custom topup: min 2k, bebas ketik
+// (2500, 10k, 25.000, 2,5k). "2.500k" kebaca 2,5jt — ketik 2500 buat 2,5rb.
+const MIN_TOPUP = 2000;
+const MAX_TOPUP = 10000000;
+function parseTopupNominal(raw) {
+  let s = String(raw || '').toLowerCase().trim().replace(/^rp\s*/, '').replace(/\s+/g, '');
+  if (!s) return null;
+  let mult = 1;
+  const suf = s.match(/^(.*?)(juta|jt|ribu|rb|k)$/);
+  if (suf) {
+    s = suf[1];
+    mult = /^(juta|jt)$/.test(suf[2]) ? 1000000 : 1000;
+  }
+  let n = null;
+  if (mult > 1 && /^(\d+)[.,](\d{1,3})$/.test(s)) {
+    n = Math.round(parseFloat(s.replace(',', '.')) * mult);
+  } else if (/^[\d.,]+$/.test(s)) {
+    n = Number(s.replace(/[.,]/g, '')) * mult;
+  } else {
+    return null;
+  }
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.floor(n);
+}
+// chatId -> 'vps' | 'otp' (user lagi diminta ketik nominal custom)
+const pendingTopupCustom = new Map();
 
 // ---- Wajib join GB Testimoni + Broadcast ke GB Promosi ----
 async function isJoinedTesti(userId) {
@@ -1158,35 +1210,25 @@ async function buildStart(name, chatId) {
   const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
   const empty = remaining < 1;
   const dot = empty ? '🔴' : percent < 30 ? '🟡' : '🟢';
-  const specLines = config.vpsSpecs.map((s) => `│  • ${s}`).join('\n');
-  const liveLines = [
-    stockOs ? `│  • OS  :  ${stockOs}` : null,
-    stockPing === null ? null : `│  • Ping VPS  :  ${stockPing} ms ${stockPing < 300 ? '🟢' : stockPing < 800 ? '🟡' : '🔴'}`,
-    ping === null ? '│  • Ping Bot  :  —' : `│  • Ping Bot  :  ${ping} ms 🟢`,
-  ].filter(Boolean).join('\n');
+  const specLines = config.vpsSpecs.map((s) => `• ${s}`).join('\n');
+  const liveBits = [
+    stockOs || null,
+    stockPing === null ? null : `Ping VPS ${stockPing}ms`,
+    ping === null ? null : `Ping Bot ${ping}ms`,
+  ].filter(Boolean).join('  •  ');
   const text =
-    `✦ ${config.shopName} ✦  🆕\n` +
-    `Halo, ${name}! 👋\n` +
-    `\n` +
-    `━━━━━━━━━━━━━━━\n` +
-    `💰 Saldo VPS  :  ${formatRupiah(balance)}\n` +
-    `\n` +
-    `📱 Saldo OTP  :  ${formatRupiah(otpBal)}\n` +
-    `━━━━━━━━━━━━━━━\n\n` +
-    `🖥️ VPS NAT — ${formatRupiah(UNIT_PRICE)} / unit\n` +
-    `\n` +
-    `📦 Spesifikasi Host :\n` +
+    `${config.shopName}\n` +
+    `Halo, ${name}!\n` +
+    `────────────────\n` +
+    `Saldo  ${formatRupiah(balance)}\n` +
+    `────────────────\n` +
+    `VPS NAT — ${formatRupiah(UNIT_PRICE)}/unit\n` +
     `${specLines ? specLines + '\n' : ''}` +
-    `\n` +
-    `📡 Spek Live :\n` +
-    `${liveLines ? liveLines + '\n' : ''}` +
-    `\n` +
-    `└ ${config.productSpec}\n` +
-    `\n` +
-    `━━━━━━━━━━━━━━━\n` +
-    `📊 Stok  :  ${dot} ${remaining}/${total}  ${stockBar(percent)}  (${percent}%)\n` +
-    (empty ? `\n❌ Stok habis — coba lagi nanti ya kak 🙏\n` : ``) +
-    `\n⚡ Auto-order setelah bayar\n🔒 Bukti otomatis di channel testimoni`;
+    `${liveBits ? liveBits + '\n' : ''}` +
+    `────────────────\n` +
+    `Stok ${dot} ${remaining}/${total} ${stockBar(percent)} ${percent}%\n` +
+    (empty ? `Stok habis, coba lagi nanti ya kak.\n` : ``) +
+    `Auto-order setelah bayar, bukti otomatis di channel.`;
   const rows = empty
     ? [[Markup.button.callback('🔄 Cek Stok', 'cek_stok')]]
     : [
@@ -1238,18 +1280,15 @@ async function specPhoto() {
 // Teks menu versi caption foto (1024 char max) — spek detail ada di gambar, di sini ringkas.
 function menuCaption(name, balance, otpBal, remaining, total, percent, dot, empty) {
   return (
-    `✦ ${config.shopName} ✦  🆕\n` +
-    `Halo, ${name}! 👋\n` +
-    `\n` +
-    `💰 Saldo VPS  :  ${formatRupiah(balance)}\n` +
-    `\n` +
-    `📱 Saldo OTP  :  ${formatRupiah(otpBal)}\n` +
-    `\n` +
-    `📦 Harga  :  1 VPS = ${formatRupiah(UNIT_PRICE)}\n` +
-    `\n` +
-    `📊 Stok  :  ${dot} ${remaining}/${total} (${percent}%)  ${stockBar(percent)}\n` +
-    (empty ? `\n❌ Stok habis — coba lagi nanti ya kak 🙏\n` : ``) +
-    `\n⚡ Auto-order setelah bayar\n🔒 Testimoni di channel`
+    `${config.shopName}\n` +
+    `Halo, ${name}!\n` +
+    `────────────────\n` +
+    `Saldo  ${formatRupiah(balance)}\n` +
+    `────────────────\n` +
+    `1 VPS = ${formatRupiah(UNIT_PRICE)}\n` +
+    `Stok ${dot} ${remaining}/${total} ${stockBar(percent)} ${percent}%\n` +
+    (empty ? `Stok habis, coba lagi nanti ya kak.\n` : ``) +
+    `Auto-order setelah bayar.`
   ).slice(0, 1000);
 }
 
@@ -1312,15 +1351,11 @@ bot.action('saldo', async (ctx) => {
 async function showSaldo(ctx) {
   const chatId = getChatId(ctx);
   const balance = await getBalance(chatId);
-  const otpBal = await getOtpBalance(chatId);
   await ctx.reply(
-    `🖥️ Saldo VPS  :  ${formatRupiah(balance)}\n` +
-    `\n` +
-    `📱 Saldo OTP  :  ${formatRupiah(otpBal)}\n` +
-    `\n` +
-    `1 VPS = ${formatRupiah(PRICE)}. Nokos mulai ~Rp1.600 pakai Saldo OTP.`,
+    `💰 Saldo  :  ${formatRupiah(balance)}\n` +
+    `1 VPS = ${formatRupiah(PRICE)}. Nokos mulai ~Rp1.600, panel mulai Rp1.000 — semua potong saldo ini.`,
     Markup.inlineKeyboard([
-      [Markup.button.callback('➕ Top Up (VPS/OTP)', 'topup')],
+      [Markup.button.callback('➕ Top Up Saldo', 'topup')],
       [Markup.button.callback(`💰 Beli 1 VPS — ${formatRupiah(PRICE)}`, 'buy_balance')],
     ])
   );
@@ -1436,19 +1471,13 @@ bot.action('buy', async (ctx) => {
 });
 
 // ---- Deposit / Top Up Saldo ----
-// DUA KANTONG (jangan ketuker):
-// - Saldo VPS: buat beli VPS.
-// - Saldo OTP: buat beli nokos.
-const TOPUP_OPTIONS = [2000, 5000, 10000, 20000, 50000, 100000];
-const OTP_TOPUP_OPTIONS = [2000, 5000, 10000, 20000, 50000];
+// SATU KANTONG: 1 dompet buat semua (VPS, panel, nokos).
+// Topup SATU PINTU via deposit RumahOTP (sekalian ngisi pool nomor).
+// QRIS langsung (Austin) cuma buat beli VPS & panel: action 'buy', 'ppay:qris'.
 
 async function getOtpBalance(chatId) {
-  try {
-    const users = await readJson(usersFile);
-    return Number(users?.[chatId]?.nokosBalance || 0);
-  } catch {
-    return 0;
-  }
+  // Alias legacy: sekarang 1 dompet, nilainya sama dengan getBalance.
+  return getBalance(chatId);
 }
 
 bot.action('topup', async (ctx) => {
@@ -1457,31 +1486,14 @@ bot.action('topup', async (ctx) => {
     await ctx.reply(`⚠️ Wajib gabung GB Testimoni dulu sebelum top up:\n👉 ${config.testiLink}`, joinGateButtons()).catch(() => {});
     return;
   }
+  if (!nokosOn()) { await ctx.reply('❌ Top up belum aktif. Hubungi admin.'); return; }
+  // SATU PINTU: pencet topup = langsung diminta ketik nominal (min 2k),
+  // masuk via deposit RumahOTP, saldo otomatis nambah 1 dompet.
+  pendingTopupCustom.set(String(getChatId(ctx)), 'otp');
+  panelWaitUsername.delete(String(getChatId(ctx)));
+  try { pendingContact.delete(String(ctx.from.id)); } catch {}
   await ctx.reply(
-    `➕ Top Up Saldo\nPilih kantong:\n🖥️ Saldo VPS\n📱 Saldo OTP (buat beli nokos)`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback('🖥️ Saldo VPS', 'topup_vps'), Markup.button.callback('📱 Saldo OTP', 'topup_otp')],
-    ])
-  );
-});
-
-bot.action('topup_vps', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  await ctx.reply(
-    `🖥️ Top Up Saldo VPS\nPilih nominal (saldo masuk setelah potong fee):`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback('Rp2.000', 'topup:2000'), Markup.button.callback('Rp5.000', 'topup:5000')],
-      [Markup.button.callback('Rp10.000', 'topup:10000'), Markup.button.callback('Rp20.000', 'topup:20000')],
-      [Markup.button.callback('Rp50.000', 'topup:50000'), Markup.button.callback('Rp100.000', 'topup:100000')],
-    ])
-  );
-});
-
-bot.action('topup_otp', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  if (!nokosOn()) { await ctx.reply('❌ Saldo OTP belum aktif. Hubungi admin.'); return; }
-  await ctx.reply(
-    `📱 Top Up Saldo OTP (min Rp2.000)\nDipakai buat beli nokos.\n⚠️ Saldo OTP tidak bisa ditarik — isi sebutuhnya.`,
+    `➕ Top Up Saldo\n1 dompet buat semua (VPS, panel, nokos).\nKetik nominal (min Rp2.000) — mis. 2500, 10k, 25.000 — atau tap cepat di bawah:`,
     Markup.inlineKeyboard([
       [Markup.button.callback('Rp2.000', 'topupotp:2000'), Markup.button.callback('Rp5.000', 'topupotp:5000')],
       [Markup.button.callback('Rp10.000', 'topupotp:10000'), Markup.button.callback('Rp20.000', 'topupotp:20000')],
@@ -1490,11 +1502,12 @@ bot.action('topup_otp', async (ctx) => {
   );
 });
 
-bot.action(/^topupotp:(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
+async function doTopupOtpOrder(ctx, nominal) {
+  if (!Number.isFinite(nominal) || nominal < MIN_TOPUP || nominal > MAX_TOPUP) {
+    await ctx.reply(`❌ Minimal topup ${formatRupiah(MIN_TOPUP)}. Contoh: 2500, 10k, 25.000.`);
+    return;
+  }
   await withPayLock(getChatId(ctx), async () => {
-  const nominal = Number(ctx.match[1]);
-  if (!OTP_TOPUP_OPTIONS.includes(nominal)) return ctx.answerCbQuery('Nominal tidak valid.');
   if (await refuseIfPending(ctx, getChatId(ctx))) return;
   let dep = null;
   try { dep = await createDeposit(nominal, 'qris'); }
@@ -1518,39 +1531,50 @@ bot.action(/^topupotp:(\d+)$/, async (ctx) => {
   startPolling(order.id);
   const qris = { image: dep.qr_image, reference: dep.id };
   await sendQrisPhoto(ctx, qris, order,
-    `📱 Top up Saldo OTP ${formatRupiah(dep.diterima || nominal)} lewat QR ini.\nBayar ${formatRupiah(dep.total)} (termasuk fee).\n\nDeposit: ${dep.id}\n${qrisExpiryText({ expiredAt: dep.expired_at })}`);
+    `📱 Top up Saldo ${formatRupiah(dep.diterima || nominal)} lewat QR ini.\nBayar ${formatRupiah(dep.total)} (termasuk fee).\n\nDeposit: ${dep.id}\n${qrisExpiryText({ expiredAt: dep.expired_at })}`);
   });
+}
+
+bot.action(/^topupotp:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  await doTopupOtpOrder(ctx, Number(ctx.match[1]));
 });
 
-// Kredit saldo OTP yang sudah dibayar via QRIS.
+bot.action(/^topup_custom:(vps|otp)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!nokosOn()) { await ctx.reply('❌ Top up belum aktif. Hubungi admin.'); return; }
+  pendingTopupCustom.set(String(getChatId(ctx)), 'otp');
+  panelWaitUsername.delete(String(getChatId(ctx)));
+  try { pendingContact.delete(String(ctx.from.id)); } catch {}
+  await ctx.reply(
+    `✏️ Ketik nominal topup (min ${formatRupiah(MIN_TOPUP)}).\nContoh: 2500, 5000, 10k, 25.000\nKetik /batal buat batalin.`
+  );
+});
+
+// Kredit topup jalur OTP (deposit RumahOTP) — masuk ke 1 dompet yang sama.
 async function creditOtpTopup(orderId) {
   const orders = await readJson(ordersFile);
   const order = orders[orderId];
   if (!order || order.kind !== 'otp_topup' || order.status !== 'pending') return false;
-  const users = await readJson(usersFile);
-  const u = users[order.chatId] || { balance: 0, nokosBalance: 0 };
-  u.nokosBalance = (Number(u.nokosBalance) || 0) + Number(order.amount || 0);
-  if (order.buyerName) u.name = order.buyerName;
-  users[order.chatId] = u;
+  const total = await addBalance(order.chatId, order.amount || 0, order.buyerName);
   order.status = 'credited';
   order.creditedAt = Date.now();
-  await writeJson(usersFile, users);
   await writeJson(ordersFile, orders);
   try {
     await bot.telegram.sendMessage(
       order.chatId,
-      `✅ Top up OTP ${formatRupiah(order.amount)} berhasil!\n📱 Saldo OTP kamu: ${formatRupiah(u.nokosBalance)}\nPilih /nokos buat beli nomor.`
+      `✅ Top up ${formatRupiah(order.amount)} berhasil!\n💰 Saldo kamu: ${formatRupiah(total)}\nPilih /nokos buat beli nomor, /start buat VPS/panel.`
     );
   } catch {}
   try {
     await notifyAdmins(
-      `📱 Topup OTP!\n👤 ${order.buyerName || 'User'} (${order.chatId})\n💰 ${formatRupiah(order.amount)} (bayar ${formatRupiah(order.total)})\n📱 Saldo OTP user: ${formatRupiah(u.nokosBalance)}\nRef: ${order.reference}`
+      `📱 Topup via OTP!\n👤 ${order.buyerName || 'User'} (${order.chatId})\n💰 ${formatRupiah(order.amount)} (bayar ${formatRupiah(order.total)})\n💰 Saldo user: ${formatRupiah(total)}\nRef: ${order.reference}`
     );
   } catch {}
   try {
     await sendTesti('topup', {
       name: order.buyerName || 'Pembeli',
-      detail: 'Top Up Saldo OTP',
+      detail: 'Top Up Saldo via OTP',
       amount: formatRupiah(order.amount),
       ref: order.reference || order.id,
     });
@@ -1566,48 +1590,7 @@ async function checkDeposit(order) {
   return depositPaid(dep);
 }
 
-bot.action(/^topup:(\d+)$/, async (ctx) => {
-  await withPayLock(getChatId(ctx), async () => {
-  const nominal = Number(ctx.match[1]);
-  if (!TOPUP_OPTIONS.includes(nominal)) return ctx.answerCbQuery('Nominal tidak valid.');
-  try {
-    if (await refuseIfPending(ctx, getChatId(ctx))) return;
-    // Topup saldo VPS via QRIS utama (austinstore) — TIDAK via RumahOTP.
-    // Khusus nokos (nbuy/topup_otp) yang via deposit RumahOTP biar pool provider keisi.
-    let qris = null;
-    try { qris = await createQris(nominal); }
-    catch (e) { await ctx.reply(`Gagal bikin QRIS: ${e.message}`); return; }
-    const chatId = getChatId(ctx);
-    const order = {
-      id: randomUUID(),
-      kind: 'topup',
-      chatId,
-      buyerName: ctx.from?.first_name || '',
-      reference: qris.reference,
-      createdAt: Date.now(),
-      expiredAt: qris.expiredAt,
-      total: qris.total,
-      amount: qris.nominal,
-      status: 'pending',
-    };
-    const orders = await readJson(ordersFile);
-    orders[order.id] = order;
-    await writeJson(ordersFile, orders);
-    startPolling(order.id);
-
-    const caption =
-      `🖥️ Top up Saldo VPS ${formatRupiah(qris.nominal)} lewat QR di foto ini.\n` +
-      `Bayar ${formatRupiah(qris.total)} (termasuk fee).\n\n` +
-      `Reference: ${qris.reference}\n` +
-      qrisExpiryText(qris);
-    await sendQrisPhoto(ctx, qris, order, caption);
-    await ctx.answerCbQuery();
-  } catch (error) {
-    await ctx.answerCbQuery('Gagal membuat QRIS.');
-    await ctx.reply(`Gagal: ${error.message}`);
-  }
-  });
-});
+// QRIS langsung khusus beli VPS & panel (Austin) ada di action 'buy' dan 'ppay:qris'.
 
 // ---- Beli pakai saldo ----
 bot.action('buy_balance', async (ctx) => {
@@ -1622,9 +1605,9 @@ bot.action('buy_balance', async (ctx) => {
     const stock = await readJson(stockFile);
     if (!Array.isArray(stock) || stock.length < 1) return { ok: false, reason: 'habis' };
     const users = await readJson(usersFile);
-    const bal = Number(users?.[chatId]?.balance || 0);
+    const bal = Number(users?.[chatId]?.balance || 0) + Number(users?.[chatId]?.nokosBalance || 0);
     if (bal < PRICE) return { ok: false, reason: 'saldo', bal };
-    users[chatId] = { ...(users[chatId] || {}), balance: bal - PRICE, name: buyerName || users[chatId]?.name };
+    users[chatId] = { ...(users[chatId] || {}), balance: bal - PRICE, nokosBalance: 0, name: buyerName || users[chatId]?.name };
     const vps = stock.splice(0, 1);
     const orders = await readJson(ordersFile);
     const order = {
@@ -1975,10 +1958,10 @@ async function showNokosDetail(ctx, serviceId, numberId, providerId, force) {
     `📱 ${tag}\n` +
     stokText +
     `💰 Harga ${formatRupiah(meta.jual)}\n` +
-    `⏰ Nomor aktif ${config.nokosTimeoutMinutes} mnt, OTP auto-forward.${force ? '\n🔄 Harga fresh.' : ''}\n\nWajib topup saldo OTP dulu, bayarnya pakai saldo:`,
+    `⏰ Nomor aktif ${config.nokosTimeoutMinutes} mnt, OTP auto-forward.${force ? '\n🔄 Harga fresh.' : ''}\n\nWajib topup saldo dulu, bayarnya pakai saldo:`,
     Markup.inlineKeyboard([
       [Markup.button.callback(`💰 Beli pakai Saldo ${formatRupiah(meta.jual)}`, `nbuybal:${serviceId}:${meta.row.number_id}:${meta.best.provider_id}`)],
-      [Markup.button.callback('📱 Top Up Saldo OTP', 'topup_otp')],
+      [Markup.button.callback('➕ Top Up Saldo', 'topup')],
       [Markup.button.callback('🔄 Refresh harga', `nkrfp:${serviceId}:${meta.row.number_id}:${meta.best.provider_id}`)],
     ])
   );
@@ -2027,8 +2010,8 @@ bot.action(/^nbuy:(\d+)(?::(\d+):([^:]+))?$/, async (ctx) => {
   // (QRIS langsung tidak mengisi pool RumahOTP.)
   await ctx.reply(
     `⚠️ QRIS langsung untuk nokos dimatikan.\n` +
-    `Top Up Saldo OTP dulu, lalu beli pakai saldo ya.`,
-    Markup.inlineKeyboard([[Markup.button.callback('📱 Top Up Saldo OTP', 'topup_otp')]])
+    `Top Up Saldo dulu, lalu beli pakai saldo ya.`,
+    Markup.inlineKeyboard([[Markup.button.callback('➕ Top Up Saldo', 'topup')]])
   );
   return;
 });
@@ -2041,10 +2024,9 @@ bot.action(/^nbuybal:(\d+)(?::(\d+):([^:]+))?$/, async (ctx) => {
   let meta = null;
   try { meta = await prepareNokosMeta(args.serviceId, args.numberId, args.providerId); }
   catch (e) { await ctx.reply(`Gagal: ${e.message}`); return; }
-  const users = await readJson(usersFile);
-  const bal = Number(users?.[chatId]?.nokosBalance || 0);
+  const bal = await getBalance(chatId);
   if (bal < meta.jual) {
-    await ctx.reply(`📱 Saldo OTP ${formatRupiah(bal)} kurang (butuh ${formatRupiah(meta.jual)}). Top up Saldo OTP dulu ya.`, Markup.inlineKeyboard([[Markup.button.callback('📱 Top Up Saldo OTP', 'topup_otp')]]));
+    await ctx.reply(`💰 Saldo ${formatRupiah(bal)} kurang (butuh ${formatRupiah(meta.jual)}). Top up dulu ya.`, Markup.inlineKeyboard([[Markup.button.callback('➕ Top Up Saldo', 'topup')]]));
     return;
   }
   if ((await countActiveNokos(chatId)) >= config.nokosMaxActive) {
@@ -2067,7 +2049,12 @@ bot.action(/^nbuybal:(\d+)(?::(\d+):([^:]+))?$/, async (ctx) => {
     await notifyAdmins(`🚨 NOKOS GAGAL (saldo user aman)\n👤 ${ctx.from?.first_name} (${chatId})\n📦 ${meta.label} ${meta.row.name} — gagal ambil nomor: ${e.message}`);
     return;
   }
-  users[chatId] = { ...(users[chatId] || {}), nokosBalance: bal - meta.jual, name: ctx.from?.first_name || users[chatId]?.name };
+  // Potong 1 dompet (modal nomor otomatis kepotong dari deposit RumahOTP via API).
+  const potong = await takeBalance(chatId, meta.jual, ctx.from?.first_name);
+  if (!potong.ok) {
+    await ctx.reply(`💰 Saldo kurang (butuh ${formatRupiah(meta.jual)}). Top up dulu ya.`, Markup.inlineKeyboard([[Markup.button.callback('➕ Top Up Saldo', 'topup')]]));
+    return;
+  }
   const order = {
     id: randomUUID(), kind: 'nokos', payMethod: 'balance',
     chatId, buyerName: ctx.from?.first_name || '',
@@ -2080,11 +2067,10 @@ bot.action(/^nbuybal:(\d+)(?::(\d+):([^:]+))?$/, async (ctx) => {
   };
   const orders = await readJson(ordersFile);
   orders[order.id] = order;
-  await writeJson(usersFile, users);
   await writeJson(ordersFile, orders);
   startNokosPoll(order.id);
   await ctx.reply(
-    `📱 Nokos aktif!\n━━━━━━━━━━━━\n📦 ${meta.label} — ${meta.row.name || 'Indonesia'}\n📞 Nomor: \`${ro.phone_number}\`\n🆔 Order: ${ro.order_id}\n📱 Saldo OTP kepotong ${formatRupiah(meta.jual)}.\n⏰ Aktif ${config.nokosTimeoutMinutes} menit, OTP otomatis diteruskan ke sini.`,
+    `📱 Nokos aktif!\n━━━━━━━━━━━━\n📦 ${meta.label} — ${meta.row.name || 'Indonesia'}\n📞 Nomor: \`${ro.phone_number}\`\n🆔 Order: ${ro.order_id}\n💰 Saldo kepotong ${formatRupiah(meta.jual)}.\n⏰ Aktif ${config.nokosTimeoutMinutes} menit, OTP otomatis diteruskan ke sini.`,
     { parse_mode: 'Markdown', ...nokosButtons(order.id) }
   );
   try {
@@ -2231,6 +2217,7 @@ const pendingContact = new Set();
 bot.action('contact_help', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   pendingContact.add(String(ctx.from.id));
+  pendingTopupCustom.delete(String(getChatId(ctx)));
   await ctx.reply(
     `🆘 Contact Admin\n\n` +
     `Ketik /contact lalu tulis pesan kamu, atau langsung kirim di sini:\n` +
@@ -2248,6 +2235,7 @@ bot.command('contact', async (ctx) => {
     return;
   }
   pendingContact.add(String(ctx.from.id));
+  pendingTopupCustom.delete(String(getChatId(ctx)));
   await ctx.reply('✍️ Tulis pesan / kirim foto masalah kamu sekarang. Nanti admin balas lewat bot ini.');
 });
 
@@ -2322,6 +2310,7 @@ bot.action(/^pbuy:(.+)$/, async (ctx) => {
   }
   await withPayLock(chatId, async () => {
     panelWaitUsername.set(String(chatId), plan.id);
+    pendingTopupCustom.delete(String(chatId));
     await ctx.answerCbQuery().catch(() => {});
     await ctx.reply(
       `📦 Panel ${plan.label} — ${formatRupiah(plan.price)}\n\nSilakan kirim USERNAME panel yang kamu mau (1 pesan, tanpa spasi, contoh: nagato01):\n\nKetik /batal kapan aja buat batalin.`,
@@ -2340,7 +2329,33 @@ bot.action('panel_cancel_input', async (ctx) => {
 bot.command('batal', async (ctx) => {
   panelWaitUsername.delete(String(getChatId(ctx)));
   pendingPanelPay.delete(String(getChatId(ctx)));
+  pendingTopupCustom.delete(String(getChatId(ctx)));
   await ctx.reply('❌ Dibatalkan. Balik ke /start kalau mau mulai lagi.');
+});
+
+// Ketikan nominal custom topup (min 2k, bebas: 2500, 10k, 25.000)
+bot.on('text', async (ctx, next) => {
+  try {
+    const chatKey = String(getChatId(ctx));
+    if (!pendingTopupCustom.has(chatKey)) return next();
+    const raw = (ctx.message?.text || '').trim();
+    if (raw.startsWith('/')) {
+      if (/^\/batal(@\w+)?/.test(raw)) {
+        pendingTopupCustom.delete(chatKey);
+        await ctx.reply('❌ Topup dibatalkan. Balik ke /start kalau mau mulai lagi.');
+      }
+      return next();
+    }
+    if (panelWaitUsername.has(chatKey)) return next();
+    const nominal = parseTopupNominal(raw);
+    if (!nominal || nominal < MIN_TOPUP || nominal > MAX_TOPUP) {
+      await ctx.reply(`❌ Nominal tidak valid. Min ${formatRupiah(MIN_TOPUP)}, contoh: 2500, 10k, 25.000.\nKetik ulang atau /batal.`);
+      return;
+    }
+    pendingTopupCustom.delete(chatKey);
+    if (!nokosOn()) { await ctx.reply('❌ Top up belum aktif. Hubungi admin.'); return; }
+    await doTopupOtpOrder(ctx, nominal);
+  } catch { try { await next(); } catch {} }
 });
 
 // Tangkap username -> buatkan QRIS sesuai harga paket
@@ -2361,6 +2376,7 @@ bot.on('text', async (ctx, next) => {
       return;
     }
     panelWaitUsername.delete(chatKey);
+    pendingTopupCustom.delete(chatKey);
     const balance = await getBalance(getChatId(ctx));
     pendingPanelPay.set(chatKey, { planId: plan.id, username });
     await ctx.reply(
@@ -2452,9 +2468,9 @@ bot.action('ppay:saldo', async (ctx) => {
   const buyerName = ctx.from?.first_name || '';
   const result = await withStockLock(async () => {
     const users = await readJson(usersFile);
-    const bal = Number(users?.[chatId]?.balance || 0);
+    const bal = Number(users?.[chatId]?.balance || 0) + Number(users?.[chatId]?.nokosBalance || 0);
     if (bal < plan.price) return { ok: false, bal };
-    users[chatId] = { ...(users[chatId] || {}), balance: bal - plan.price, name: buyerName || users[chatId]?.name };
+    users[chatId] = { ...(users[chatId] || {}), balance: bal - plan.price, nokosBalance: 0, name: buyerName || users[chatId]?.name };
     const orders = await readJson(ordersFile);
     const order = {
       id: randomUUID(),
