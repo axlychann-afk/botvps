@@ -126,6 +126,10 @@ function savePendingInput() {
       panelUser: Object.fromEntries(panelWaitUsername),
       panelPay: Object.fromEntries(pendingPanelPay),
       contact: [...pendingContact],
+      // timer sengaja TIDAK disimpan (Timeout object bikin JSON circular).
+      menu: Object.fromEntries(
+        [...lastMenu].map(([k, v]) => [k, { chat: v?.chat, mid: v?.mid, kind: v?.kind === 'text' ? 'text' : 'video' }])
+      ),
     };
     writeJson(pendingInputFile, data).catch(() => {});
   } catch {}
@@ -141,6 +145,9 @@ async function loadPendingInput() {
         if (v && typeof v === 'object') pendingPanelPay.set(String(k), v);
       }
       for (const u of g.contact || []) pendingContact.add(String(u));
+      for (const [k, v] of Object.entries(g.menu || {})) {
+        if (v && v.mid && v.chat) lastMenu.set(String(k), { chat: v.chat, mid: v.mid, kind: v.kind === 'text' ? 'text' : 'video' });
+      }
     }
   } catch {}
 }
@@ -1593,9 +1600,52 @@ function videoDown() {
 function videoOk() { videoFails = 0; }
 function videoAlive() { return !START_VIDEO_URL || Date.now() >= videoDeadUntil; }
 
-// Menu /start: video + teks + tombol, kirim baru tiap kali.
+// Menu /start: video + teks + tombol.
+// /start BERULANG ngedit pesan yang sama (anti-spam bawah).
+// Auto-refresh tiap 3 detik (ping/RAM/Uptime/CPU gerak), 2 menit.
+// 1 timer per chat (yang lama dimatikan tiap menu baru). Timer ga ikut ke disk.
+const lastMenu = new Map(); // chatKey -> { chat, mid, kind, timer? }
+function stopMenuRefresh(key) {
+  try {
+    const p = lastMenu.get(String(key));
+    if (p && p.timer) clearInterval(p.timer);
+  } catch {}
+}
+function startMenuRefresh(chatId, cid, mid, name, buttons, kind = 'video') {
+  const key = String(chatId);
+  stopMenuRefresh(key);
+  try {
+    let ticks = 0, fails = 0, busy = false;
+    const timer = setInterval(async () => {
+      if (busy) return;
+      busy = true;
+      ticks++;
+      if (ticks > 40) { clearInterval(timer); return; } // 40x3 dtk = 2 menit
+      try {
+        const fresh = await buildStart(name, chatId, { elapsedSec: ticks * 3, totalSec: 120 });
+        if (kind === 'text') {
+          await bot.telegram.editMessageText(cid, mid, undefined, fresh.text, { ...buttons });
+        } else {
+          await bot.telegram.editMessageCaption(cid, mid, undefined, videoCaption(fresh.text), { ...buttons });
+        }
+        fails = 0;
+      } catch (e) {
+        if (String(e?.message || '').includes('not modified')) { busy = false; return; }
+        console.error(`Refresh menu ${chatId} gagal (${fails + 1}/3):`, e?.message || e);
+        if (++fails >= 3) clearInterval(timer);
+      }
+      busy = false;
+    }, 3000);
+    if (timer && typeof timer.unref === 'function') {
+      try { timer.unref(); } catch {}
+    }
+    const cur = lastMenu.get(key) || {};
+    lastMenu.set(key, { chat: cur.chat ?? cid, mid: cur.mid ?? mid, kind, timer });
+  } catch {}
+}
 // Tanpa edit/refresh/timer/stiker.
 async function sendStartMenu(ctx, name, chatId) {
+  const key = String(chatId);
   let text, buttons;
   try {
     // Guard 12 dtk: buildStart ada ping TCP + getMe, kalau Telegram lemot
@@ -1610,6 +1660,23 @@ async function sendStartMenu(ctx, name, chatId) {
     buttons = Markup.inlineKeyboard([
       [Markup.button.callback('🔄 Cek Stok', 'cek_stok')],
     ]);
+  }
+  const prev = lastMenu.get(key);
+  if (prev && prev.mid) {
+    try {
+      if (prev.kind === 'text' || !START_VIDEO_URL) {
+        await ctx.telegram.editMessageText(prev.chat, prev.mid, undefined, text, { ...buttons });
+        startMenuRefresh(chatId, prev.chat, prev.mid, name, buttons, 'text');
+      } else {
+        await ctx.telegram.editMessageCaption(prev.chat, prev.mid, undefined, videoCaption(text), {
+          ...buttons,
+        });
+        startMenuRefresh(chatId, prev.chat, prev.mid, name, buttons, 'video');
+      }
+      return;
+    } catch (e) {
+      console.error('edit menu lama gagal, kirim baru:', e?.message || e);
+    }
   }
   if (START_VIDEO_URL && videoAlive()) {
     try {
@@ -1627,6 +1694,8 @@ async function sendStartMenu(ctx, name, chatId) {
       ]);
       if (sent?.message_id) {
         videoOk();
+        lastMenu.set(key, { chat: sent.chat.id, mid: sent.message_id, kind: 'video' });
+        startMenuRefresh(chatId, sent.chat.id, sent.message_id, name, buttons, 'video');
         return;
       }
       console.error('kirim video menu: sent kosong, fallback teks.');
@@ -1636,7 +1705,11 @@ async function sendStartMenu(ctx, name, chatId) {
     }
   }
   try {
-    await ctx.reply(text, buttons);
+    const sentText = await ctx.reply(text, buttons);
+    if (sentText?.message_id) {
+      lastMenu.set(key, { chat: sentText.chat.id, mid: sentText.message_id, kind: 'text' });
+      startMenuRefresh(chatId, sentText.chat.id, sentText.message_id, name, buttons, 'text');
+    }
   } catch (e) {
     console.error('kirim teks menu gagal:', e?.message || e);
   }
@@ -1693,7 +1766,25 @@ bot.action('cek_stok', async (ctx) => {
     const chatId = getChatId(ctx);
     await ctx.answerCbQuery().catch(() => {});
     const { text, buttons } = await buildStart(name, chatId, { elapsedSec: 0, totalSec: 120 });
-    await ctx.reply(text, buttons);
+    const prev = lastMenu.get(String(chatId));
+    if (prev && prev.mid) {
+      try {
+        if (prev.kind === 'video') {
+          await ctx.telegram.editMessageCaption(prev.chat, prev.mid, undefined, videoCaption(text), { ...buttons });
+        } else {
+          await ctx.telegram.editMessageText(prev.chat, prev.mid, undefined, text, { ...buttons });
+        }
+        startMenuRefresh(chatId, prev.chat, prev.mid, name, buttons, prev.kind === 'video' ? 'video' : 'text');
+        return;
+      } catch (e) {
+        console.error('cek_stok edit gagal:', e?.message || e);
+      }
+    }
+    const sent = await ctx.reply(text, buttons);
+    if (sent?.message_id) {
+      lastMenu.set(String(chatId), { chat: sent.chat.id, mid: sent.message_id, kind: 'text' });
+      startMenuRefresh(chatId, sent.chat.id, sent.message_id, name, buttons, 'text');
+    }
   } catch (e) {
     console.error('cek_stok gagal:', e?.message || e);
     await ctx.answerCbQuery('Gagal cek stok.').catch(() => {});
