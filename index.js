@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
-import { access, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, rename, writeFile, unlink } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1451,28 +1451,33 @@ function menuCaption(name, balance, otpBal, remaining, total, percent, dot, empt
 
 const START_VIDEO_URL = process.env.START_VIDEO_URL || 'https://files.catbox.moe/xhuon5.mp4';
 
-// Menu /start: video dulu, fallback foto spek, fallback teks.
+// Menu /start: video pembuka TANPA tombol, lalu 1 pesan teks menu + tombol.
+// (Caption + tombol dalam 1 card bikin tombol kelihatan "nembus" / ga sejajar.)
 async function sendStartMenu(ctx, name, chatId) {
   const { text, buttons } = await buildStart(name, chatId);
-  const remaining = await getStockCount();
-  const balance = chatId ? await getBalance(chatId) : 0;
-  const otpBal = chatId ? await getOtpBalance(chatId) : 0;
-  const total = config.stockTotal > 0 ? config.stockTotal : Math.max(remaining, 1);
-  const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
-  const dot = remaining < 1 ? '🔴' : percent < 30 ? '🟡' : '🟢';
-  const caption = menuCaption(name, balance, otpBal, remaining, total, percent, dot, remaining < 1);
   if (START_VIDEO_URL) {
     try {
-      await ctx.replyWithVideo({ url: START_VIDEO_URL }, { caption, supports_streaming: true, ...buttons });
-      return;
+      await ctx.replyWithVideo(
+        { url: START_VIDEO_URL },
+        { caption: `${config.shopName}\nHalo, ${name}!`, supports_streaming: true }
+      );
     } catch {}
-  }
-  const photo = await specPhoto();
-  if (photo) {
-    try {
-      await ctx.replyWithPhoto({ source: photo }, { caption, ...buttons });
-      return;
-    } catch {}
+  } else {
+    const remaining = await getStockCount();
+    const balance = chatId ? await getBalance(chatId) : 0;
+    const otpBal = chatId ? await getOtpBalance(chatId) : 0;
+    const total = config.stockTotal > 0 ? config.stockTotal : Math.max(remaining, 1);
+    const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
+    const dot = remaining < 1 ? '🔴' : percent < 30 ? '🟡' : '🟢';
+    const photo = await specPhoto();
+    if (photo) {
+      try {
+        await ctx.replyWithPhoto(
+          { source: photo },
+          { caption: menuCaption(name, balance, otpBal, remaining, total, percent, dot, remaining < 1) }
+        );
+      } catch {}
+    }
   }
   await ctx.reply(text, buttons);
 }
@@ -3160,9 +3165,31 @@ bot.command('tambahsaldo', async (ctx) => {
 });
 
 // ---- Start ----
+const lockFile = path.join(dataDir, 'bot.lock');
+async function acquireLock() {
+  let old = null;
+  try { old = await readJson(lockFile); } catch {}
+  if (old && Number(old.pid) && Number(old.pid) !== process.pid) {
+    try {
+      process.kill(Number(old.pid), 0); // masih hidup?
+      console.error(`Bot sudah jalan (pid ${old.pid}). Matikan dulu proses lama sebelum start yang baru.`);
+      process.exit(1);
+    } catch {
+      // pid mati / tak bisa dicek -> ambil alih lock
+    }
+  }
+  try { await writeJson(lockFile, { pid: process.pid, startedAt: Date.now() }); } catch {}
+}
+async function releaseLock() {
+  try {
+    const cur = await readJson(lockFile).catch(() => null);
+    if (cur && Number(cur.pid) === process.pid) await unlink(lockFile).catch(() => {});
+  } catch {}
+}
 try {
   await ensureData();
   await loadPendingInput();
+  await acquireLock();
 } catch (e) {
   console.error(`Gagal start: ${e.message}`);
   process.exit(1);
@@ -3242,5 +3269,5 @@ if (backupHours > 0 && backupTarget) {
   console.log(`Auto-backup tiap ${backupHours} jam ke ${backupTarget}`);
 }
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+process.once('SIGINT', () => { releaseLock().finally(() => { try { bot.stop('SIGINT'); } catch {} }); });
+process.once('SIGTERM', () => { releaseLock().finally(() => { try { bot.stop('SIGTERM'); } catch {} }); });
