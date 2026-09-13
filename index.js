@@ -1834,6 +1834,7 @@ bot.start(async (ctx) => {
     console.log(`/start dobel dari ${ctx.from?.id} dibuang (5 dtk).`);
     return;
   }
+  try {
   const name = ctx.from?.first_name || 'kak';
   const chatId = getChatId(ctx);
   console.log(`/start dari ${ctx.from?.id} (${name}) chat=${chatId}`);
@@ -1851,6 +1852,25 @@ bot.start(async (ctx) => {
     return;
   }
   await sendStartMenu(ctx, name, chatId).catch((e) => console.error('sendStartMenu gagal:', e?.message || e));
+  } catch (e) {
+    // Pelampung terakhir: /start TIDAK BOLEH sunyi. Apa pun yang pecah di atas,
+    // user tetap dapat balasan + sebabnya masuk log.
+    console.error('FATAL /start:', e?.message || e);
+    try {
+      await ctx.reply(
+        `⚠️ Start gagal, coba /start lagi.\nKalau masih gagal, /contact admin ya.`
+      );
+    } catch {}
+  }
+});
+
+// Diagnosa hidup/mati: /ping HARUS selalu dibalas. Kalau /ping diam juga,
+// masalahnya bukan menu — proses/token/polling yang mati.
+bot.command('ping', async (ctx) => {
+  try {
+    const up = Math.floor(process.uptime());
+    await ctx.reply(`🏓 Pong! Bot hidup.\nUptime proses: ${Math.floor(up / 60)} mnt ${up % 60} dtk.`);
+  } catch {}
 });
 
 bot.action('cek_stok', async (ctx) => {
