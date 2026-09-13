@@ -552,36 +552,127 @@ function testiSvg({ title, name, detail, amount, date, ref }) {
 </svg>`;
 }
 
-// Kartu gambar spek VPS (gaya neofetch) — /spek kirim foto ini.
+// Kartu gambar spek VPS — layout 2 kolom: kiri logo OS bulat, kanan detail.
+// Logo digambar murni pakai SVG (tanpa file eksternal) biar tajam di sharp.
+function osBrand(osRaw) {
+  const s = String(osRaw || '').toLowerCase();
+  if (s.includes('ubuntu')) return { key: 'ubuntu', label: 'Ubuntu', c1: '#E95420', c2: '#77216F', fg: '#ffffff' };
+  if (s.includes('kali')) return { key: 'kali', label: 'Kali Linux', c1: '#367BF0', c2: '#0a1930', fg: '#ffffff' };
+  if (s.includes('debian')) return { key: 'debian', label: 'Debian', c1: '#D70A53', c2: '#7a003e', fg: '#ffffff' };
+  if (s.includes('fedora')) return { key: 'fedora', label: 'Fedora', c1: '#294172', c2: '#51a2da', fg: '#ffffff' };
+  if (s.includes('arch')) return { key: 'arch', label: 'Arch', c1: '#1793D1', c2: '#0b3d5c', fg: '#ffffff' };
+  if (s.includes('centos') || s.includes('alma') || s.includes('rocky')) return { key: 'centos', label: 'CentOS', c1: '#932279', c2: '#262577', fg: '#ffffff' };
+  if (s.includes('mint')) return { key: 'mint', label: 'Mint', c1: '#87CF3E', c2: '#1a3d0a', fg: '#ffffff' };
+  return { key: 'linux', label: 'Linux', c1: '#22c55e', c2: '#0e7490', fg: '#ffffff' };
+}
+
+// Glyph tiap distro di dalam lingkaran, center di (cx, cy), radius r.
+function osGlyphSvg(brand, cx, cy, r) {
+  const fg = brand.fg;
+  if (brand.key === 'ubuntu') {
+    // Ubuntu CoF: lingkaran tengah + 3 lingkaran luar + penghubung
+    const o = r * 0.24, mid = r * 0.30, len = r * 0.62;
+    const pts = [
+      [cx - len * 0.86, cy - len * 0.5],
+      [cx + len * 0.86, cy - len * 0.5],
+      [cx, cy + len],
+    ];
+    return `<g stroke="${fg}" stroke-width="${r * 0.10}" stroke-linecap="round">` +
+      `<line x1="${cx}" y1="${cy}" x2="${pts[0][0]}" y2="${pts[0][1]}"/>` +
+      `<line x1="${cx}" y1="${cy}" x2="${pts[1][0]}" y2="${pts[1][1]}"/>` +
+      `<line x1="${cx}" y1="${cy}" x2="${pts[2][0]}" y2="${pts[2][1]}"/></g>` +
+      `<circle cx="${cx}" cy="${cy}" r="${mid}" fill="none" stroke="${fg}" stroke-width="${r * 0.12}"/>` +
+      pts.map(([x, y]) => `<circle cx="${x}" cy="${y}" r="${o}" fill="none" stroke="${fg}" stroke-width="${r * 0.12}"/>`).join('');
+  }
+  if (brand.key === 'debian') {
+    // Swirl Debian disederhanakan: spiral + ekor
+    return `<path d="M ${cx - r * 0.45} ${cy + r * 0.35} C ${cx - r * 0.7} ${cy - r * 0.4}, ${cx + r * 0.5} ${cy - r * 0.75}, ${cx + r * 0.35} ${cy + r * 0.05} C ${cx + r * 0.25} ${cy + r * 0.45}, ${cx - r * 0.3} ${cy + r * 0.3}, ${cx - r * 0.1} ${cy - r * 0.1} C ${cx + r * 0.05} ${cy - r * 0.35}, ${cx + r * 0.45} ${cy - r * 0.1}, ${cx + r * 0.2} ${cy + r * 0.3}" fill="none" stroke="${fg}" stroke-width="${r * 0.14}" stroke-linecap="round"/>` +
+      `<circle cx="${cx + r * 0.42}" cy="${cy - r * 0.48}" r="${r * 0.10}" fill="${fg}"/>`;
+  }
+  if (brand.key === 'kali') {
+    // Naga Kali disederhanakan jadi "K" tegas + garis tebas
+    return `<text x="${cx}" y="${cy + r * 0.38}" text-anchor="middle" font-family="Arial,sans-serif" font-size="${r * 1.15}" font-weight="900" fill="${fg}">K</text>` +
+      `<line x1="${cx - r * 0.55}" y1="${cy + r * 0.55}" x2="${cx + r * 0.55}" y2="${cy - r * 0.45}" stroke="${fg}" stroke-width="${r * 0.10}" stroke-linecap="round" opacity="0.85"/>`;
+  }
+  if (brand.key === 'linux') {
+    // Tux minimalis: badan + mata + paruh, tetap kebaca di ukuran kecil
+    return `<ellipse cx="${cx}" cy="${cy + r * 0.10}" rx="${r * 0.48}" ry="${r * 0.58}" fill="${fg}"/>` +
+      `<ellipse cx="${cx}" cy="${cy + r * 0.28}" rx="${r * 0.30}" ry="${r * 0.36}" fill="${brand.c1}"/>` +
+      `<circle cx="${cx - r * 0.16}" cy="${cy - r * 0.12}" r="${r * 0.09}" fill="#0b1220"/>` +
+      `<circle cx="${cx + r * 0.16}" cy="${cy - r * 0.12}" r="${r * 0.09}" fill="#0b1220"/>` +
+      `<circle cx="${cx - r * 0.13}" cy="${cy - r * 0.15}" r="${r * 0.03}" fill="#ffffff"/>` +
+      `<circle cx="${cx + r * 0.19}" cy="${cy - r * 0.15}" r="${r * 0.03}" fill="#ffffff"/>` +
+      `<ellipse cx="${cx}" cy="${cy + r * 0.02}" rx="${r * 0.11}" ry="${r * 0.08}" fill="#f59e0b"/>`;
+  }
+  // Distro lain: inisial tegas
+  const initial = brand.label.slice(0, 1).toUpperCase();
+  return `<text x="${cx}" y="${cy + r * 0.38}" text-anchor="middle" font-family="Arial,sans-serif" font-size="${r * 1.1}" font-weight="900" fill="${fg}">${initial}</text>`;
+}
+
 function specSvg({ rows, pingVps, pingBot, stock }) {
   const shop = escXml(config.shopName);
-  const line = (y, k, v, color = '#ffffff') =>
-    `<text x="110" y="${y}" font-family="Arial,sans-serif" font-size="23" fill="#94a3b8">${escXml(k)}</text>` +
-    `<text x="300" y="${y}" font-family="Arial,sans-serif" font-size="23" font-weight="bold" fill="${color}">: ${escXml(v)}</text>`;
-  return `<svg width="800" height="600" viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg">
+  const osFull = rows.os || 'Ubuntu 22.04.5 LTS x86_64';
+  const brand = osBrand(osFull);
+  const osShort = brand.label;
+
+  const row = (y, label, value, color = '#ffffff') =>
+    `<text x="400" y="${y}" font-family="Arial,sans-serif" font-size="22" fill="#8fa1b8">${escXml(label)}</text>` +
+    `<text x="545" y="${y}" font-family="Arial,sans-serif" font-size="22" font-weight="bold" fill="${color}">:  ${escXml(value)}</text>`;
+
+  const pingVpsTxt = pingVps === null || pingVps === undefined ? '—' : `${pingVps} ms`;
+  const pingVpsCol = pingVps === null || pingVps === undefined ? '#ffffff' : pingVps < 300 ? '#22c55e' : pingVps < 800 ? '#fbbf24' : '#ef4444';
+  const pingBotTxt = pingBot === null || pingBot === undefined ? '—' : `${pingBot} ms`;
+  const stockTxt = `${stock} unit ready`;
+  const stockCol = Number(stock) < 1 ? '#ef4444' : '#22c55e';
+  const pingRowVal = (pingBot !== null && pingBot !== undefined) ? `${pingVpsTxt}  •  Bot ${pingBotTxt}` : pingVpsTxt;
+
+  return `<svg width="960" height="600" viewBox="0 0 960 600" xmlns="http://www.w3.org/2000/svg">
 <defs>
 <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-<stop offset="0" stop-color="#0b1220"/><stop offset="1" stop-color="#1b2a4a"/>
+<stop offset="0" stop-color="#070d1a"/><stop offset="0.55" stop-color="#0b1a33"/><stop offset="1" stop-color="#132a4d"/>
 </linearGradient>
 <linearGradient id="acc" x1="0" y1="0" x2="1" y2="0">
 <stop offset="0" stop-color="#22c55e"/><stop offset="1" stop-color="#22d3ee"/>
 </linearGradient>
+<linearGradient id="osbg" x1="0" y1="0" x2="1" y2="1">
+<stop offset="0" stop-color="${brand.c1}"/><stop offset="1" stop-color="${brand.c2}"/>
+</linearGradient>
+<filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
+<feDropShadow dx="0" dy="8" stdDeviation="14" flood-color="#000000" flood-opacity="0.45"/>
+</filter>
 </defs>
-<rect x="8" y="8" width="784" height="584" rx="24" fill="url(#bg)" stroke="#22c55e" stroke-width="3"/>
-<rect x="8" y="8" width="784" height="10" rx="5" fill="url(#acc)"/>
-<text x="400" y="80" text-anchor="middle" font-family="Arial,sans-serif" font-size="38" font-weight="bold" fill="#ffffff" letter-spacing="2">💻 SPESIFIKASI VPS</text>
-<rect x="110" y="102" width="580" height="4" rx="2" fill="url(#acc)"/>
-${line(155, 'OS', rows.os || 'Ubuntu 22.04.5 LTS x86_64')}
-${line(200, 'Host', rows.host || 'Google Compute Engine')}
-${line(245, 'Kernel', rows.kernel || '6.18.15 cloud-amd64')}
-${line(290, 'CPU', rows.cpu || 'Xeon Platinum 8581C (32) @ 2.1GHz', '#22d3ee')}
-${line(335, 'RAM', rows.ram || '258GB DDR5', '#22c55e')}
-${line(380, 'Uptime', rows.uptime || '47+ hari nonstop')}
-${line(425, 'Harga', formatRupiah(UNIT_PRICE) + ' / unit', '#fbbf24')}
-${line(470, 'Ping VPS', pingVps === null ? '—' : pingVps + ' ms', '#22c55e')}
-${line(515, 'Stok', stock + ' unit ready')}
-<rect x="110" y="535" width="580" height="4" rx="2" fill="url(#acc)"/>
-<text x="400" y="572" text-anchor="middle" font-family="Arial,sans-serif" font-size="22" font-weight="bold" fill="#ffffff">${shop}</text>
+<rect x="8" y="8" width="944" height="584" rx="26" fill="url(#bg)" stroke="#22c55e" stroke-width="3"/>
+<rect x="30" y="8" width="900" height="8" rx="4" fill="url(#acc)"/>
+<text x="480" y="78" text-anchor="middle" font-family="Arial,sans-serif" font-size="36" font-weight="900" fill="#ffffff" letter-spacing="3">SPESIFIKASI VPS</text>
+<text x="480" y="108" text-anchor="middle" font-family="Arial,sans-serif" font-size="20" fill="#8fa1b8" letter-spacing="1">${shop}  •  NAT  •  Unlimited</text>
+<rect x="60" y="130" width="840" height="4" rx="2" fill="url(#acc)" opacity="0.9"/>
+<!-- KIRI: badge OS -->
+<g filter="url(#soft)">
+<rect x="60" y="160" width="280" height="360" rx="22" fill="#0e172b" stroke="#24365a" stroke-width="2"/>
+<rect x="60" y="160" width="280" height="360" rx="22" fill="none" stroke="url(#acc)" stroke-width="1.5" opacity="0.35"/>
+<circle cx="200" cy="290" r="88" fill="url(#osbg)"/>
+<circle cx="200" cy="290" r="88" fill="none" stroke="#ffffff" stroke-width="3" opacity="0.9"/>
+<circle cx="200" cy="290" r="74" fill="none" stroke="#ffffff" stroke-width="1.5" opacity="0.35"/>
+${osGlyphSvg(brand, 200, 290, 62)}
+<text x="200" y="410" text-anchor="middle" font-family="Arial,sans-serif" font-size="30" font-weight="900" fill="#ffffff">${escXml(osShort)}</text>
+<text x="200" y="438" text-anchor="middle" font-family="monospace" font-size="16" fill="#8fa1b8">${escXml(String(osFull).slice(0, 30))}</text>
+<rect x="118" y="458" width="164" height="34" rx="17" fill="url(#acc)"/>
+<text x="200" y="482" text-anchor="middle" font-family="Arial,sans-serif" font-size="18" font-weight="900" fill="#06281a">● ONLINE</text>
+</g>
+<!-- garis pemisah -->
+<rect x="365" y="160" width="3" height="360" rx="1.5" fill="#24365a"/>
+<!-- KANAN: detail -->
+${row(198, 'OS', String(osFull).slice(0, 34))}
+${row(240, 'Host', rows.host || 'Google Compute Engine')}
+${row(282, 'Kernel', rows.kernel || '6.18.15 cloud-amd64')}
+${row(324, 'CPU', rows.cpu || 'Xeon Platinum 8581C (32)', '#22d3ee')}
+${row(366, 'RAM', rows.ram || '258GB DDR5', '#22c55e')}
+${row(408, 'Disk', rows.disk || 'NVMe SSD')}
+${row(450, 'Harga', formatRupiah(UNIT_PRICE) + ' / unit', '#fbbf24')}
+${row(492, 'Ping', pingRowVal, pingVpsCol)}
+${row(534, 'Stok', stockTxt, stockCol)}
+<rect x="60" y="540" width="840" height="4" rx="2" fill="url(#acc)" opacity="0.9"/>
+<text x="480" y="574" text-anchor="middle" font-family="Arial,sans-serif" font-size="19" fill="#8fa1b8">Ketik /start untuk order  •  Auto-order setelah bayar</text>
 </svg>`;
 }
 
@@ -606,16 +697,17 @@ async function sendSpecCard(ctx, quiet = false) {
   } catch {}
   const sharp = await getSharp();
   const caption = quiet
-    ? `💻 Spesifikasi VPS ${config.shopName} — detail & order di bawah 👇`
-    : `💻 Spesifikasi VPS ${config.shopName}\n💰 ${formatRupiah(UNIT_PRICE)}/unit — pencet /start buat order.`;
+    ? `💻 Spesifikasi VPS ${config.shopName}\n\nDetail lengkap ada di gambar 👇\nPencet /start buat order.`
+    : `💻 Spesifikasi VPS ${config.shopName}\n\n💰 Harga  :  ${formatRupiah(UNIT_PRICE)} / unit\n📊 Stok  :  ${stock} unit ready\n\nDetail lengkap ada di gambar 👇\nPencet /start buat order.`;
   if (sharp) {
     try {
       const rows = {
         os: os || 'Ubuntu 22.04.5 LTS x86_64',
         host: 'Google Compute Engine',
         kernel: '6.18.15 cloud-amd64',
-        cpu: 'Xeon Platinum 8581C (32) @ 2.1GHz',
+        cpu: 'Xeon Platinum 8581C (32)',
         ram: '258GB DDR5',
+        disk: 'NVMe SSD',
         uptime: '47+ hari nonstop',
       };
       const buf = await sharp(Buffer.from(specSvg({ rows, pingVps, pingBot: null, stock }))).png().toBuffer();
@@ -623,7 +715,15 @@ async function sendSpecCard(ctx, quiet = false) {
       return;
     } catch (e) { console.error('Gagal bikin kartu spek:', e.message); }
   }
-  await ctx.reply(caption + `\nOS: Ubuntu 22.04.5 LTS\nCPU: Xeon Platinum 8581C (32)\nRAM: 258GB\nStok: ${stock} unit`);
+  await ctx.reply(
+    caption +
+    `\n\n━━━━━━━━━━━━━━━\n` +
+    `🖥️ OS  :  ${os || 'Ubuntu 22.04.5 LTS'}\n` +
+    `⚙️ CPU  :  Xeon Platinum 8581C (32)\n` +
+    `🧠 RAM  :  258GB DDR5\n` +
+    `💾 Disk  :  NVMe SSD\n` +
+    `📊 Stok  :  ${stock} unit`
+  );
 }
 
 bot.command('spek', async (ctx) => { await sendSpecCard(ctx); });
@@ -1045,21 +1145,27 @@ async function buildStart(name, chatId) {
   const dot = empty ? '🔴' : percent < 30 ? '🟡' : '🟢';
   const specLines = config.vpsSpecs.map((s) => `│  • ${s}`).join('\n');
   const liveLines = [
-    stockOs ? `│  • OS : ${stockOs}` : null,
-    stockPing === null ? null : `│  • Ping VPS : ${stockPing} ms ${stockPing < 300 ? '🟢' : stockPing < 800 ? '🟡' : '🔴'}`,
-    ping === null ? '│  • Ping Bot : —' : `│  • Ping Bot : ${ping} ms`,
+    stockOs ? `│  • OS  :  ${stockOs}` : null,
+    stockPing === null ? null : `│  • Ping VPS  :  ${stockPing} ms ${stockPing < 300 ? '🟢' : stockPing < 800 ? '🟡' : '🔴'}`,
+    ping === null ? '│  • Ping Bot  :  —' : `│  • Ping Bot  :  ${ping} ms 🟢`,
   ].filter(Boolean).join('\n');
   const text =
     `✦ ${config.shopName} ✦\n` +
     `Halo, ${name}! 👋\n\n` +
-    `💰 VPS: ${formatRupiah(balance)} | 📱 OTP: ${formatRupiah(otpBal)}\n\n` +
-    `🖥️ VPS NAT — ${formatRupiah(UNIT_PRICE)}/unit\n` +
-    `${specLines ? specLines + '\n' : ''}` +
-    `${liveLines ? liveLines + '\n' : ''}` +
+    `━━━━━━━━━━━━━━━\n` +
+    `💰 Saldo VPS  :  ${formatRupiah(balance)}\n` +
+    `📱 Saldo OTP  :  ${formatRupiah(otpBal)}\n` +
+    `━━━━━━━━━━━━━━━\n\n` +
+    `🖥️ VPS NAT — ${formatRupiah(UNIT_PRICE)} / unit\n\n` +
+    `📦 Spesifikasi Host :\n` +
+    `${specLines ? specLines + '\n' : ''}\n` +
+    `📡 Spek Live :\n` +
+    `${liveLines ? liveLines + '\n' : ''}\n` +
     `└ ${config.productSpec}\n\n` +
-    `📊 Stok: ${dot} ${remaining}/${total} ${stockBar(percent)}\n` +
-    (empty ? `❌ Stok habis — coba lagi nanti.\n` : ``) +
-    `⚡ Auto-order setelah bayar, bukti di channel testimoni`;
+    `━━━━━━━━━━━━━━━\n` +
+    `📊 Stok  :  ${dot} ${remaining}/${total}  ${stockBar(percent)}  (${percent}%)\n` +
+    (empty ? `\n❌ Stok habis — coba lagi nanti ya kak 🙏\n` : ``) +
+    `\n⚡ Auto-order setelah bayar\n🔒 Bukti otomatis di channel testimoni`;
   const rows = empty
     ? [[Markup.button.callback('🔄 Cek Stok', 'cek_stok')]]
     : [
@@ -1099,8 +1205,9 @@ async function specPhoto() {
       os: os || 'Ubuntu 22.04.5 LTS x86_64',
       host: 'Google Compute Engine',
       kernel: '6.18.15 cloud-amd64',
-      cpu: 'Xeon Platinum 8581C (32) @ 2.1GHz',
+      cpu: 'Xeon Platinum 8581C (32)',
       ram: '258GB DDR5',
+      disk: 'NVMe SSD',
       uptime: '47+ hari nonstop',
     };
     return await sharp(Buffer.from(specSvg({ rows, pingVps, pingBot: null, stock }))).png().toBuffer();
@@ -1110,11 +1217,14 @@ async function specPhoto() {
 // Teks menu versi caption foto (1024 char max) — spek detail ada di gambar, di sini ringkas.
 function menuCaption(name, balance, otpBal, remaining, total, percent, dot, empty) {
   return (
-    `✦ ${config.shopName} ✦ — Halo, ${name}! 👋\n` +
-    `💰 VPS: ${formatRupiah(balance)} | 📱 OTP: ${formatRupiah(otpBal)} | 📦 1 VPS = ${formatRupiah(UNIT_PRICE)}\n` +
-    `📊 Stok : ${dot} ${remaining}/${total} (${percent}%) ${stockBar(percent)}\n` +
-    (empty ? `❌ Stok habis — coba lagi nanti.\n` : ``) +
-    `⚡ Auto-order setelah bayar 🔒 Testimoni di channel`
+    `✦ ${config.shopName} ✦\n` +
+    `Halo, ${name}! 👋\n\n` +
+    `💰 Saldo VPS  :  ${formatRupiah(balance)}\n` +
+    `📱 Saldo OTP  :  ${formatRupiah(otpBal)}\n` +
+    `📦 Harga  :  1 VPS = ${formatRupiah(UNIT_PRICE)}\n\n` +
+    `📊 Stok  :  ${dot} ${remaining}/${total} (${percent}%)  ${stockBar(percent)}\n` +
+    (empty ? `\n❌ Stok habis — coba lagi nanti ya kak 🙏\n` : ``) +
+    `\n⚡ Auto-order setelah bayar\n🔒 Testimoni di channel`
   ).slice(0, 1000);
 }
 
