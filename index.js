@@ -126,10 +126,6 @@ function savePendingInput() {
       panelUser: Object.fromEntries(panelWaitUsername),
       panelPay: Object.fromEntries(pendingPanelPay),
       contact: [...pendingContact],
-      // timer sengaja TIDAK disimpan (Timeout object bikin JSON circular).
-      menu: Object.fromEntries(
-        [...lastMenu].map(([k, v]) => [k, { chat: v?.chat, mid: v?.mid, kind: v?.kind === 'text' ? 'text' : 'video' }])
-      ),
     };
     writeJson(pendingInputFile, data).catch(() => {});
   } catch {}
@@ -145,9 +141,6 @@ async function loadPendingInput() {
         if (v && typeof v === 'object') pendingPanelPay.set(String(k), v);
       }
       for (const u of g.contact || []) pendingContact.add(String(u));
-      for (const [k, v] of Object.entries(g.menu || {})) {
-        if (v && v.mid && v.chat) lastMenu.set(String(k), { chat: v.chat, mid: v.mid, kind: v.kind === 'text' ? 'text' : 'video' });
-      }
     }
   } catch {}
 }
@@ -1600,156 +1593,9 @@ function videoDown() {
 function videoOk() { videoFails = 0; }
 function videoAlive() { return !START_VIDEO_URL || Date.now() >= videoDeadUntil; }
 
-// Menu /start: video + teks lengkap + tombol.
-// /start BERULANG ngedit pesan yang sama (command user ga diapa-apain).
-// Auto-refresh tiap 3 detik (ping/RAM/Uptime/CPU gerak), 2 menit.
-// Pesan menu dihapus/kedaluwarsa -> dikirim BARU otomatis (ga ilang).
-// 1 timer per chat. Timer TIDAK disimpan ke disk.
-// Auto-refresh DIMATIKAN sementara (bikin /start error).
-// Set true kalau mau nyalakan lagi.
-const ENABLE_MENU_REFRESH = false;
-const lastMenu = new Map(); // chatKey -> { chat, mid, kind, text, timer, gen }
-const menuGen = new Map(); // chatKey -> nomor generasi (bunuh timer yatim)
-function stopMenuRefresh(key) {
-  key = String(key);
-  try {
-    // Naikkan generasi DULU — timer yatim yang masih hidup cek ini
-    // tiap tick dan bunuh diri, jadi ga ada lagi 2 timer edit 1 pesan.
-    menuGen.set(key, (menuGen.get(key) || 0) + 1);
-    const p = lastMenu.get(key);
-    if (p && p.timer) clearInterval(p.timer);
-  } catch {}
-}
-async function resendMenu(chatId, name) {
-  const key = String(chatId);
-  const { text, buttons } = await buildStart(name, chatId, { elapsedSec: 0, totalSec: 120 });
-  if (START_VIDEO_URL && videoAlive()) {
-    try {
-      const sent = await Promise.race([
-        bot.telegram.sendVideo(
-          chatId,
-          { url: START_VIDEO_URL },
-          { caption: videoCaption(text), supports_streaming: true, ...buttons }
-        ),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('video-timeout')), 10000)),
-      ]);
-      if (sent?.message_id) {
-        videoOk();
-        lastMenu.set(key, { chat: sent.chat.id, mid: sent.message_id, kind: 'video', text });
-        return;
-      }
-      console.error('resendMenu: sent video kosong.');
-    } catch (e) {
-      console.error('resendMenu video gagal:', e?.message || e);
-      videoDown();
-    }
-  }
-  const sentText = await bot.telegram.sendMessage(chatId, text, { ...buttons });
-  if (sentText?.message_id) lastMenu.set(key, { chat: sentText.chat.id, mid: sentText.message_id, kind: 'text', text });
-}
-function startMenuRefresh(chatId, name) {
-  if (!ENABLE_MENU_REFRESH) return;
-  const key = String(chatId);
-  stopMenuRefresh(key);
-  const myGen = menuGen.get(key) || 0;
-  try {
-    let ticks = 0, fails = 0, busy = false;
-    const TOTAL = 40, GAP = 3000; // 40x3 dtk = 2 menit
-    const timer = setInterval(async () => {
-      // Timer yatim (ada /start baru sesudah gw lahir) -> bunuh diri.
-      // Ini obat "timer bentrok, yang atas yang ke-edit".
-      try {
-        const cur0 = lastMenu.get(key);
-        if (!cur0 || cur0.gen !== myGen || (cur0.timer && cur0.timer !== timer)) {
-          clearInterval(timer);
-          return;
-        }
-      } catch {}
-      if (busy) return;
-      busy = true;
-      try {
-        ticks++;
-        if (ticks > TOTAL) {
-          try {
-            const p = lastMenu.get(key);
-            if (p) lastMenu.set(key, { chat: p.chat, mid: p.mid, kind: p.kind, text: p.text, gen: myGen });
-          } catch {}
-          clearInterval(timer);
-          return;
-        }
-        try {
-          const { text, buttons } = await buildStart(name, chatId, { elapsedSec: ticks * 3, totalSec: 120 });
-          const prev = lastMenu.get(key);
-          if (prev && prev.mid) {
-            // Skip edit kalau isi beneran sama (hemat API), tapi karena ada
-            // jam+detik+countdown, ini jarang kejadian.
-            if (prev.text === text) return;
-            try {
-              if (prev.kind === 'text' || !START_VIDEO_URL) {
-                await bot.telegram.editMessageText(prev.chat, prev.mid, undefined, text, { ...buttons });
-                lastMenu.set(key, { chat: prev.chat, mid: prev.mid, kind: prev.kind || 'text', text, timer, gen: myGen });
-              } else {
-                await bot.telegram.editMessageCaption(prev.chat, prev.mid, undefined, videoCaption(text), { ...buttons });
-                lastMenu.set(key, { chat: prev.chat, mid: prev.mid, kind: 'video', text, timer, gen: myGen });
-              }
-            } catch (e) {
-              const msg = String(e?.message || e);
-              if (msg.includes('not modified')) return;
-              // Pesan dihapus / video kedaluwarsa -> kirim baru, jangan nunggu 3x gagal.
-              if (/deleted|not found|bad request|message to edit/i.test(msg)) {
-                await resendMenu(chatId, name);
-                const e2 = lastMenu.get(key) || {};
-                lastMenu.set(key, { chat: e2.chat, mid: e2.mid, kind: e2.kind, text: e2.text, timer, gen: myGen });
-                fails = 0;
-                ticks = 0;
-                return;
-              }
-              throw e;
-            }
-          } else {
-            await resendMenu(chatId, name);
-            const e2 = lastMenu.get(key) || {};
-            lastMenu.set(key, { chat: e2.chat, mid: e2.mid, kind: e2.kind, text: e2.text, timer, gen: myGen });
-          }
-          fails = 0;
-        } catch (e) {
-          if (String(e?.message || '').includes('not modified')) return;
-          // 429 flood -> jangan resend brutal, tunggu tick berikut.
-          if (/429|too many|flood|retry after/i.test(String(e?.message || ''))) {
-            console.error(`Refresh menu ${chatId} kena rate-limit, skip tick ${ticks}`);
-            return;
-          }
-          console.error(`Refresh menu ${chatId} gagal (${fails + 1}/3):`, e?.message || e);
-          if (++fails >= 3) {
-            try {
-              await resendMenu(chatId, name);
-              const e3 = lastMenu.get(key) || {};
-              lastMenu.set(key, { chat: e3.chat, mid: e3.mid, kind: e3.kind, text: e3.text, timer, gen: myGen });
-              fails = 0;
-              ticks = 0;
-            } catch (re) {
-              console.error(`Kirim ulang menu ${chatId} gagal:`, re?.message || re);
-              clearInterval(timer);
-            }
-          }
-        }
-      } finally {
-        busy = false;
-      }
-    }, GAP);
-    // NOTE: sengaja TANPA unref — unref bikin timer bisa mati di VPS idle,
-    // itu salah satu penyebab "refresh ga jalan".
-    const cur = lastMenu.get(key) || {};
-    lastMenu.set(key, { chat: cur.chat, mid: cur.mid, kind: cur.kind, text: cur.text, timer, gen: myGen });
-  } catch {}
-}
+// Menu /start: video + teks + tombol, kirim baru tiap kali.
+// Tanpa edit/refresh/timer/stiker.
 async function sendStartMenu(ctx, name, chatId) {
-  const key = String(chatId);
-  // Stop timer lama SEBELUM build (build itu lambat: ping+cpu),
-  // biar ga ada 2 timer hidup bareng.
-  const old = lastMenu.get(key);
-  stopMenuRefresh(key);
-  const myGen = menuGen.get(key) || 0;
   let text, buttons;
   try {
     // Guard 12 dtk: buildStart ada ping TCP + getMe, kalau Telegram lemot
@@ -1765,25 +1611,6 @@ async function sendStartMenu(ctx, name, chatId) {
       [Markup.button.callback('🔄 Cek Stok', 'cek_stok')],
     ]);
   }
-  const prev = old && old.mid ? old : lastMenu.get(key);
-  if (prev && prev.mid) {
-    try {
-      if (prev.kind === 'text' || !START_VIDEO_URL) {
-        await ctx.telegram.editMessageText(prev.chat, prev.mid, undefined, text, { ...buttons });
-        lastMenu.set(key, { chat: prev.chat, mid: prev.mid, kind: 'text', text, gen: myGen });
-      } else {
-        await ctx.telegram.editMessageCaption(prev.chat, prev.mid, undefined, videoCaption(text), {
-          ...buttons,
-        });
-        lastMenu.set(key, { chat: prev.chat, mid: prev.mid, kind: 'video', text, gen: myGen });
-      }
-      startMenuRefresh(chatId, name);
-      return;
-    } catch (e) {
-      console.error('edit menu lama gagal, kirim baru:', e?.message || e);
-      // Edit gagal (pesan dihapus / terlalu tua) -> lanjut kirim baru di bawah.
-    }
-  }
   if (START_VIDEO_URL && videoAlive()) {
     try {
       const sent = await Promise.race([
@@ -1795,17 +1622,11 @@ async function sendStartMenu(ctx, name, chatId) {
             ...buttons,
           }
         ),
-        // 10 dtk cukup buat catbox; 25 dtk bikin user dikira "menu ga muncul".
+        // 10 dtk cukup buat catbox; kelamaan bikin user dikira "menu ga muncul".
         new Promise((_, rej) => setTimeout(() => rej(new Error('video-timeout')), 10000)),
       ]);
       if (sent?.message_id) {
         videoOk();
-        // Hapus menu atas yang yatim biar cuma 1 menu — obat "yang atas yang ke-edit".
-        if (prev && prev.mid && prev.mid !== sent.message_id) {
-          try { await ctx.telegram.deleteMessage(prev.chat, prev.mid); } catch {}
-        }
-        lastMenu.set(key, { chat: sent.chat.id, mid: sent.message_id, kind: 'video', text, gen: myGen });
-        startMenuRefresh(chatId, name);
         return;
       }
       console.error('kirim video menu: sent kosong, fallback teks.');
@@ -1815,14 +1636,7 @@ async function sendStartMenu(ctx, name, chatId) {
     }
   }
   try {
-    const sentText = await ctx.reply(text, buttons);
-    if (sentText?.message_id) {
-      if (prev && prev.mid && prev.mid !== sentText.message_id) {
-        try { await ctx.telegram.deleteMessage(prev.chat, prev.mid); } catch {}
-      }
-      lastMenu.set(key, { chat: sentText.chat.id, mid: sentText.message_id, kind: 'text', text, gen: myGen });
-      startMenuRefresh(chatId, name);
-    }
+    await ctx.reply(text, buttons);
   } catch (e) {
     console.error('kirim teks menu gagal:', e?.message || e);
   }
@@ -1879,30 +1693,7 @@ bot.action('cek_stok', async (ctx) => {
     const chatId = getChatId(ctx);
     await ctx.answerCbQuery().catch(() => {});
     const { text, buttons } = await buildStart(name, chatId, { elapsedSec: 0, totalSec: 120 });
-    const prev = lastMenu.get(String(chatId));
-    if (prev && prev.mid) {
-      try {
-        if (prev.kind === 'video') {
-          await ctx.telegram.editMessageCaption(prev.chat, prev.mid, undefined, videoCaption(text), { ...buttons });
-        } else {
-          await ctx.telegram.editMessageText(prev.chat, prev.mid, undefined, text, { ...buttons });
-        }
-        lastMenu.set(String(chatId), { ...prev, text });
-        startMenuRefresh(chatId, name);
-        return;
-      } catch (e) {
-        console.error('cek_stok edit gagal:', e?.message || e);
-      }
-    }
-    const sent = await ctx.reply(text, buttons);
-    if (sent?.message_id) {
-      const oldMid = prev?.mid;
-      if (oldMid && oldMid !== sent.message_id) {
-        try { await ctx.telegram.deleteMessage(prev.chat, oldMid); } catch {}
-      }
-      lastMenu.set(String(chatId), { chat: sent.chat.id, mid: sent.message_id, kind: 'text', text });
-      startMenuRefresh(chatId, name);
-    }
+    await ctx.reply(text, buttons);
   } catch (e) {
     console.error('cek_stok gagal:', e?.message || e);
     await ctx.answerCbQuery('Gagal cek stok.').catch(() => {});
