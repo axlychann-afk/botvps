@@ -1620,7 +1620,7 @@ function startMenuRefresh(chatId, cid, mid, name, buttons, kind = 'video') {
       if (busy) return;
       busy = true;
       ticks++;
-      if (ticks > 40) { clearInterval(timer); return; } // 40x3 dtk = 2 menit
+      if (ticks > 40) { clearInterval(timer); console.log(`Refresh menu ${chatId} selesai (2 mnt).`); return; } // 40x3 dtk = 2 menit
       try {
         const fresh = await buildStart(name, chatId, { elapsedSec: ticks * 3, totalSec: 120 });
         if (kind === 'text') {
@@ -1636,9 +1636,8 @@ function startMenuRefresh(chatId, cid, mid, name, buttons, kind = 'video') {
       }
       busy = false;
     }, 3000);
-    if (timer && typeof timer.unref === 'function') {
-      try { timer.unref(); } catch {}
-    }
+    // SENGAJA tanpa unref: unref bikin timer mati kalau event-loop idle,
+    // itu penyebab "refresh cuma jalan 1x" di VPS.
     const cur = lastMenu.get(key) || {};
     lastMenu.set(key, { chat: cur.chat ?? cid, mid: cur.mid ?? mid, kind, timer });
   } catch {}
