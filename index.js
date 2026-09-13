@@ -1574,14 +1574,14 @@ async function dropMsg(ctx, m) {
 // Fallback teks bila video gagal.
 // Menu /start: video + teks lengkap + tombol.
 // /start / cek stok BERULANG ngedit pesan yang sama (anti-spam bawah).
-// Auto-refresh tiap 4 detik, 2 menit pertama.
+// Auto-refresh tiap 3 detik (brutal), 2 menit pertama.
 const lastMenu = new Map(); // chatKey -> { chat, mid, kind: 'video' | 'text' }
 function startMenuRefresh(chatId, cid, mid, name, buttons, kind = 'video') {
   try {
     let ticks = 0, fails = 0;
     const timer = setInterval(async () => {
       ticks++;
-      if (ticks > 30) { clearInterval(timer); return; } // 30x4 dtk = 2 menit
+      if (ticks > 40) { clearInterval(timer); return; } // 40x3 dtk = 2 menit
       try {
         const fresh = await buildStart(name, chatId);
         if (kind === 'text') {
@@ -1596,7 +1596,7 @@ function startMenuRefresh(chatId, cid, mid, name, buttons, kind = 'video') {
         if (String(e?.message || '').includes('not modified')) return;
         if (++fails >= 3) clearInterval(timer);
       }
-    }, 4000);
+    }, 3000);
     if (timer && typeof timer.unref === 'function') {
       try { timer.unref(); } catch {}
     }
