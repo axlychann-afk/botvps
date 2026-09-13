@@ -1327,16 +1327,77 @@ function formatRupiah(n) {
 function fmtGB(bytes) {
   return `${(Number(bytes || 0) / 1e9).toFixed(2)} GB`;
 }
-function fmtUptime(sec) {
+function fmtUptime(sec, withSec = false) {
   sec = Math.max(0, Math.floor(Number(sec) || 0));
   const d = Math.floor(sec / 86400);
   const h = Math.floor((sec % 86400) / 3600);
   const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
   const parts = [];
   if (d) parts.push(`${d} hari`);
   if (h) parts.push(`${h} jam`);
   parts.push(`${m} menit`);
+  if (withSec) parts.push(`${s} dtk`);
   return parts.join(', ');
+}
+// Cache ping biar tick 3-dtk enteng (getMe + TCP tiap tick = berat + skip terus).
+const pingCache = { bot: null, vps: null, at: 0 };
+const PING_TTL_MS = 10000;
+async function pingBotCached() {
+  const now = Date.now();
+  if (pingCache.bot !== null && now - pingCache.at < PING_TTL_MS) return pingCache.bot;
+  const t0 = Date.now();
+  try {
+    await Promise.race([
+      bot.telegram.getMe(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000)),
+    ]);
+    pingCache.bot = Date.now() - t0;
+  } catch { pingCache.bot = null; }
+  pingCache.at = now;
+  return pingCache.bot;
+}
+async function pingVpsCached() {
+  const now = Date.now();
+  if (pingCache.vps !== undefined && pingCache.vpsAt && now - pingCache.vpsAt < PING_TTL_MS) return pingCache.vps;
+  let out = null;
+  try {
+    const stock = await readJson(stockFile);
+    const first = Array.isArray(stock) ? stock.find((v) => v && v.ip) : null;
+    if (first) {
+      const p0 = Date.now();
+      const sock = (await import('node:net')).default;
+      await new Promise((resolve) => {
+        const s = sock.connect(Number(first.port) || 22, first.ip);
+        s.setTimeout(2000);
+        s.on('connect', () => { out = Date.now() - p0; s.destroy(); resolve(); });
+        s.on('timeout', () => { s.destroy(); resolve(); });
+        s.on('error', () => resolve());
+      });
+    }
+  } catch {}
+  pingCache.vps = out;
+  pingCache.vpsAt = now;
+  return out;
+}
+// Disk live: df di linux, fallback statis biar ga hang.
+async function diskLive() {
+  try {
+    const { execFile } = await import('node:child_process');
+    const out = await new Promise((resolve) => {
+      execFile('df', ['-h', '/'], { timeout: 2000 }, (e, stdout) => {
+        if (e) return resolve(null);
+        resolve(String(stdout || ''));
+      });
+    });
+    if (!out) return null;
+    const lines = out.trim().split('\n');
+    const last = lines[lines.length - 1] || '';
+    const cols = last.trim().split(/\s+/);
+    // Filesystem Size Used Avail Use% Mounted
+    if (cols.length >= 5) return `${cols[2]} / ${cols[1]} (${cols[4]})`;
+    return null;
+  } catch { return null; }
 }
 function cpuSnapshot() {
   let idle = 0, total = 0;
@@ -1375,37 +1436,18 @@ function stockBar(percent) {
 
 // Tampilan /start gaya auto-order dengan stok & saldo live.
 // Kalau stok < 2, tombol beli diganti tombol refresh (order diblokir di action 'buy' juga).
-async function buildStart(name, chatId) {
-  const t0 = Date.now();
+async function buildStart(name, chatId, tickInfo = null) {
   const remaining = await getStockCount();
   const balance = chatId ? await getBalance(chatId) : 0;
   const otpBal = chatId ? await getOtpBalance(chatId) : 0;
-  let ping = null;
-  try {
-    // getMe dibatasi 8 dtk biar /start ga hang kalau Telegram lemot.
-    await Promise.race([
-      bot.telegram.getMe(),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000)),
-    ]);
-    ping = Date.now() - t0;
-  } catch { ping = null; }
-  // Spek live dari data stok: OS unit pertama + ping TCP ke IP stok pertama.
-  let stockOs = null, stockPing = null;
+  // Ping via cache (TTL 10 dtk) — tick 3 dtk jadi enteng, ga skip.
+  const [ping, stockPing] = await Promise.all([pingBotCached(), pingVpsCached()]);
+  // Spek live dari data stok: OS unit pertama.
+  let stockOs = null;
   try {
     const stock = await readJson(stockFile);
     const first = Array.isArray(stock) ? stock.find((v) => v && v.ip) : null;
-    if (first) {
-      stockOs = first.os || null;
-      const p0 = Date.now();
-      const sock = (await import('node:net')).default;
-      await new Promise((resolve) => {
-        const s = sock.connect(Number(first.port) || 22, first.ip);
-        s.setTimeout(3000);
-        s.on('connect', () => { stockPing = Date.now() - p0; s.destroy(); resolve(); });
-        s.on('timeout', () => { s.destroy(); resolve(); });
-        s.on('error', () => resolve());
-      });
-    }
+    if (first) stockOs = first.os || null;
   } catch {}
   const total = config.stockTotal > 0 ? config.stockTotal : Math.max(remaining, 1);
   const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
@@ -1425,19 +1467,26 @@ async function buildStart(name, chatId) {
     stockPing === null ? null : `Ping VPS ${stockPing}ms`,
     ping === null ? null : `Ping Bot ${ping}ms`,
   ].filter(Boolean).join('  •  ');
-  // Stat live mesin bot: CPU % (sampling 250ms), RAM, uptime — berubah tiap /start.
-  let hostOs = null, hostKernel = null, hostCpu = null, hostRam = null, hostUp = null;
+  // Stat live mesin bot: CPU % (sampling 100ms biar tick 3-dtk ga ketumpuk), RAM, disk, uptime + detik.
+  let hostOs = null, hostKernel = null, hostCpu = null, hostRam = null, hostDisk = null, hostUp = null;
   try {
     hostOs = `${os.platform()} (${os.arch()})`;
     hostKernel = String(os.release() || '');
     const model = (os.cpus()?.[0]?.model || '').trim().replace(/\s+/g, ' ');
-    const use = await cpuPercent(250);
+    const use = await cpuPercent(100);
     hostCpu = `${model || 'CPU'}${use === null ? '' : ` — ${use}%`}`;
     const totalMem = os.totalmem(), usedMem = totalMem - os.freemem();
     const pct = totalMem > 0 ? Math.round((usedMem / totalMem) * 100) : 0;
     hostRam = `${fmtGB(usedMem)} / ${fmtGB(totalMem)} (${pct}%)`;
-    hostUp = fmtUptime(os.uptime());
+    hostDisk = (await diskLive()) || 'NVMe SSD';
+    hostUp = fmtUptime(os.uptime(), true);
   } catch {}
+  // Jam update + countdown: bikin tiap tick 3-dtk PASTI beda isi,
+  // jadi Telegram ga nolak "message is not modified" (penyebab keliatan mandek).
+  const nowWib = new Date(Date.now() + 7 * 3600 * 1000).toISOString().slice(11, 19);
+  const leftSec = tickInfo ? Math.max(0, tickInfo.totalSec - tickInfo.elapsedSec) : null;
+  const leftTxt = leftSec === null ? '' : ` • sisa ${Math.floor(leftSec / 60)}:${String(leftSec % 60).padStart(2, '0')}`;
+  const liveStamp = `🔄 update ${nowWib} WIB${leftTxt}`;
   const text =
     `${config.shopName}\n` +
     `Halo, ${name}!\n` +
@@ -1458,11 +1507,12 @@ async function buildStart(name, chatId) {
     (hostKernel ? `• Kernel: ${hostKernel}\n` : ``) +
     (hostCpu ? `• CPU: ${hostCpu}\n` : ``) +
     (hostRam ? `• RAM: ${hostRam}\n` : ``) +
+    (hostDisk ? `• Disk: ${hostDisk}\n` : ``) +
     (hostUp ? `• Uptime: ${hostUp}\n` : ``) +
     `────────────────\n` +
     `Stok ${dot} ${remaining}/${total} ${stockBar(percent)} ${percent}%\n` +
     (empty ? `Stok habis, coba lagi nanti ya kak.\n` : ``) +
-    footer;
+    `${footer}\n${liveStamp}`;
   const rows = empty
     ? [[Markup.button.callback('🔄 Cek Stok', 'cek_stok')]]
     : [
@@ -1511,19 +1561,27 @@ async function specPhoto() {
   } catch (e) { console.error('Gagal bikin kartu spek:', e.message); return null; }
 }
 
-// Teks menu versi caption foto (1024 char max) — spek detail ada di gambar, di sini ringkas.
-function menuCaption(name, balance, otpBal, remaining, total, percent, dot, empty) {
-  return (
-    `${config.shopName}\n` +
-    `Halo, ${name}!\n` +
-    `────────────────\n` +
-    `Saldo  ${formatRupiah(balance)}\n` +
-    `────────────────\n` +
-    `1 VPS = ${formatRupiah(UNIT_PRICE)}\n` +
-    `Stok ${dot} ${remaining}/${total} ${stockBar(percent)} ${percent}%\n` +
-    (empty ? `Stok habis, coba lagi nanti ya kak.\n` : ``) +
-    `Auto-order setelah bayar.`
-  ).slice(0, 1000);
+// Caption video: versi pendek <1024 char TAPI tetap live (ping/disk/uptime/jam).
+// Fix utama "update 3 dtk ga jalan": sebelumnya pakai text.slice(0,1024) —
+// kepotong di tengah, footer/stamp yg berubah malah kebuang, isi caption
+// sama terus -> Telegram tolak "not modified" -> keliatan mandek.
+function videoCaption(fullText) {
+  const lines = String(fullText || '').split('\n');
+  // Ambil head (shop+saldo+harga) + blok live (ping + spek host + stok + stamp).
+  const keep = [];
+  let inLive = false;
+  for (const ln of lines) {
+    if (/Ping VPS|Ping Bot/.test(ln)) inLive = true;
+    if (/Spek Host Live|Stok |🔄 update|Auto-order|Butuh bantuan|Gabisa masang|Tutor masang|gabisa buat install/.test(ln)) inLive = true;
+    if (ln.startsWith(config.shopName) || ln.startsWith('Halo,') || ln.includes('Saldo') || ln.includes('VPS NAT') || inLive) keep.push(ln);
+    if (ln.startsWith('🔄 update')) break;
+  }
+  let out = keep.join('\n');
+  if (!/🔄 update/.test(out)) {
+    const tail = lines.slice(-4).join('\n');
+    out = `${out}\n${tail}`;
+  }
+  return out.slice(0, 1000);
 }
 
 const START_VIDEO_URL = process.env.START_VIDEO_URL || 'https://files.catbox.moe/sausq2.mp4';
@@ -1542,49 +1600,79 @@ function stopMenuRefresh(key) {
 }
 async function resendMenu(chatId, name) {
   const key = String(chatId);
-  const { text, buttons } = await buildStart(name, chatId);
+  const { text, buttons } = await buildStart(name, chatId, { elapsedSec: 0, totalSec: 120 });
   if (START_VIDEO_URL) {
     try {
       const sent = await Promise.race([
         bot.telegram.sendVideo(
           chatId,
           { url: START_VIDEO_URL },
-          { caption: text.slice(0, 1024), supports_streaming: true, ...buttons }
+          { caption: videoCaption(text), supports_streaming: true, ...buttons }
         ),
         new Promise((_, rej) => setTimeout(() => rej(new Error('video-timeout')), 25000)),
       ]);
       if (sent?.message_id) {
-        lastMenu.set(key, { chat: sent.chat.id, mid: sent.message_id, kind: 'video' });
+        lastMenu.set(key, { chat: sent.chat.id, mid: sent.message_id, kind: 'video', text });
         return;
       }
     } catch {}
   }
   const sentText = await bot.telegram.sendMessage(chatId, text, { ...buttons });
-  if (sentText?.message_id) lastMenu.set(key, { chat: sentText.chat.id, mid: sentText.message_id, kind: 'text' });
+  if (sentText?.message_id) lastMenu.set(key, { chat: sentText.chat.id, mid: sentText.message_id, kind: 'text', text });
 }
 function startMenuRefresh(chatId, name) {
   const key = String(chatId);
   stopMenuRefresh(key);
   try {
     let ticks = 0, fails = 0, busy = false;
+    const TOTAL = 40, GAP = 3000; // 40x3 dtk = 2 menit
     const timer = setInterval(async () => {
       if (busy) return;
       busy = true;
       ticks++;
-      if (ticks > 40) { clearInterval(timer); return; } // 40x3 dtk = 2 menit
+      if (ticks > TOTAL) {
+        try {
+          const p = lastMenu.get(key);
+          if (p) lastMenu.set(key, { chat: p.chat, mid: p.mid, kind: p.kind, text: p.text });
+        } catch {}
+        clearInterval(timer);
+        busy = false;
+        return;
+      }
       try {
-        const { text, buttons } = await buildStart(name, chatId);
+        const { text, buttons } = await buildStart(name, chatId, { elapsedSec: ticks * 3, totalSec: 120 });
         const prev = lastMenu.get(key);
         if (prev && prev.mid) {
-          if (prev.kind === 'text' || !START_VIDEO_URL) {
-            await bot.telegram.editMessageText(prev.chat, prev.mid, undefined, text, { ...buttons });
-          } else {
-            await bot.telegram.editMessageCaption(prev.chat, prev.mid, undefined, text.slice(0, 1024), { ...buttons });
+          // Skip edit kalau isi beneran sama (hemat API), tapi karena ada
+          // jam+detik+countdown, ini jarang kejadian.
+          if (prev.text === text) { busy = false; return; }
+          try {
+            if (prev.kind === 'text' || !START_VIDEO_URL) {
+              await bot.telegram.editMessageText(prev.chat, prev.mid, undefined, text, { ...buttons });
+              lastMenu.set(key, { chat: prev.chat, mid: prev.mid, kind: prev.kind || 'text', text, timer });
+            } else {
+              await bot.telegram.editMessageCaption(prev.chat, prev.mid, undefined, videoCaption(text), { ...buttons });
+              lastMenu.set(key, { chat: prev.chat, mid: prev.mid, kind: 'video', text, timer });
+            }
+          } catch (e) {
+            const msg = String(e?.message || e);
+            if (msg.includes('not modified')) { busy = false; return; }
+            // Pesan dihapus / video kedaluwarsa -> kirim baru, jangan nunggu 3x gagal.
+            if (/deleted|not found|bad request|message to edit/i.test(msg)) {
+              await resendMenu(chatId, name);
+              const e2 = lastMenu.get(key) || {};
+              lastMenu.set(key, { chat: e2.chat, mid: e2.mid, kind: e2.kind, text: e2.text, timer });
+              fails = 0;
+              ticks = 0;
+              busy = false;
+              return;
+            }
+            throw e;
           }
         } else {
           await resendMenu(chatId, name);
           const e2 = lastMenu.get(key) || {};
-          lastMenu.set(key, { chat: e2.chat, mid: e2.mid, kind: e2.kind, timer });
+          lastMenu.set(key, { chat: e2.chat, mid: e2.mid, kind: e2.kind, text: e2.text, timer });
         }
         fails = 0;
       } catch (e) {
@@ -1594,7 +1682,7 @@ function startMenuRefresh(chatId, name) {
           try {
             await resendMenu(chatId, name);
             const e3 = lastMenu.get(key) || {};
-            lastMenu.set(key, { chat: e3.chat, mid: e3.mid, kind: e3.kind, timer });
+            lastMenu.set(key, { chat: e3.chat, mid: e3.mid, kind: e3.kind, text: e3.text, timer });
             fails = 0;
             ticks = 0;
           } catch (re) {
@@ -1604,19 +1692,18 @@ function startMenuRefresh(chatId, name) {
         }
       }
       busy = false;
-    }, 3000);
-    if (timer && typeof timer.unref === 'function') {
-      try { timer.unref(); } catch {}
-    }
+    }, GAP);
+    // NOTE: sengaja TANPA unref — unref bikin timer bisa mati di VPS idle,
+    // itu salah satu penyebab "refresh ga jalan".
     const cur = lastMenu.get(key) || {};
-    lastMenu.set(key, { chat: cur.chat, mid: cur.mid, kind: cur.kind, timer });
+    lastMenu.set(key, { chat: cur.chat, mid: cur.mid, kind: cur.kind, text: cur.text, timer });
   } catch {}
 }
 async function sendStartMenu(ctx, name, chatId) {
   const key = String(chatId);
   let text, buttons;
   try {
-    ({ text, buttons } = await buildStart(name, chatId));
+    ({ text, buttons } = await buildStart(name, chatId, { elapsedSec: 0, totalSec: 120 }));
   } catch {
     text = `${config.shopName}\nHalo, ${name}!\nKetik /saldo buat cek saldo, /start buat menu.`;
     buttons = Markup.inlineKeyboard([
@@ -1628,10 +1715,12 @@ async function sendStartMenu(ctx, name, chatId) {
     try {
       if (prev.kind === 'text' || !START_VIDEO_URL) {
         await ctx.telegram.editMessageText(prev.chat, prev.mid, undefined, text, { ...buttons });
+        lastMenu.set(key, { chat: prev.chat, mid: prev.mid, kind: 'text', text });
       } else {
-        await ctx.telegram.editMessageCaption(prev.chat, prev.mid, undefined, text.slice(0, 1024), {
+        await ctx.telegram.editMessageCaption(prev.chat, prev.mid, undefined, videoCaption(text), {
           ...buttons,
         });
+        lastMenu.set(key, { chat: prev.chat, mid: prev.mid, kind: 'video', text });
       }
       startMenuRefresh(chatId, name);
       return;
@@ -1643,7 +1732,7 @@ async function sendStartMenu(ctx, name, chatId) {
         ctx.replyWithVideo(
           { url: START_VIDEO_URL },
           {
-            caption: text.slice(0, 1024),
+            caption: videoCaption(text),
             supports_streaming: true,
             ...buttons,
           }
@@ -1651,7 +1740,7 @@ async function sendStartMenu(ctx, name, chatId) {
         new Promise((_, rej) => setTimeout(() => rej(new Error('video-timeout')), 25000)),
       ]);
       if (sent?.message_id) {
-        lastMenu.set(key, { chat: sent.chat.id, mid: sent.message_id, kind: 'video' });
+        lastMenu.set(key, { chat: sent.chat.id, mid: sent.message_id, kind: 'video', text });
         startMenuRefresh(chatId, name);
       }
       return;
@@ -1660,7 +1749,7 @@ async function sendStartMenu(ctx, name, chatId) {
   try {
     const sentText = await ctx.reply(text, buttons);
     if (sentText?.message_id) {
-      lastMenu.set(key, { chat: sentText.chat.id, mid: sentText.message_id, kind: 'text' });
+      lastMenu.set(key, { chat: sentText.chat.id, mid: sentText.message_id, kind: 'text', text });
       startMenuRefresh(chatId, name);
     }
   } catch {}
@@ -1690,15 +1779,17 @@ bot.action('cek_stok', async (ctx) => {
   try {
     const name = ctx.from?.first_name || 'kak';
     const chatId = getChatId(ctx);
-    const { text, buttons } = await buildStart(name, chatId);
+    const { text, buttons } = await buildStart(name, chatId, { elapsedSec: 0, totalSec: 120 });
     await ctx.answerCbQuery();
     const prev = lastMenu.get(String(chatId));
     if (prev && prev.mid) {
       try {
         if (prev.kind === 'video') {
-          await ctx.telegram.editMessageCaption(prev.chat, prev.mid, undefined, text.slice(0, 1024), { ...buttons });
+          await ctx.telegram.editMessageCaption(prev.chat, prev.mid, undefined, videoCaption(text), { ...buttons });
+          lastMenu.set(String(chatId), { ...prev, text });
         } else {
           await ctx.telegram.editMessageText(prev.chat, prev.mid, undefined, text, { ...buttons });
+          lastMenu.set(String(chatId), { ...prev, text });
         }
         startMenuRefresh(chatId, name);
         return;
@@ -1706,7 +1797,7 @@ bot.action('cek_stok', async (ctx) => {
     }
     const sent = await ctx.reply(text, buttons);
     if (sent?.message_id) {
-      lastMenu.set(String(chatId), { chat: sent.chat.id, mid: sent.message_id, kind: 'text' });
+      lastMenu.set(String(chatId), { chat: sent.chat.id, mid: sent.message_id, kind: 'text', text });
       startMenuRefresh(chatId, name);
     }
   } catch {
