@@ -1383,6 +1383,18 @@ async function buildStart(name, chatId) {
     `${specLines ? specLines + '\n' : ''}` +
     `${liveBits ? liveBits + '\n' : ''}` +
     `────────────────\n` +
+    `Kenapa order di sini:\n` +
+    `• Server Xeon E5-2690 v4, 16 threads, RAM 62.88 GB\n` +
+    `• Uptime 18 hari+ nonstop\n` +
+    `• Auto-order, data langsung dikirim setelah bayar\n` +
+    `• Testimoni real di channel\n` +
+    `────────────────\n` +
+    `Spek Host:\n` +
+    `• OS: linux (x64)\n` +
+    `• Kernel: 5.15.0-190-generic\n` +
+    `• CPU: Xeon E5-2690 v4 @ 2.60GHz\n` +
+    `• Disk: 342.9 GB\n` +
+    `────────────────\n` +
     `Stok ${dot} ${remaining}/${total} ${stockBar(percent)} ${percent}%\n` +
     (empty ? `Stok habis, coba lagi nanti ya kak.\n` : ``) +
     `Auto-order setelah bayar, bukti otomatis di channel.`;
@@ -1422,13 +1434,13 @@ async function specPhoto() {
       }
     } catch {}
     const rows = {
-      os: os || 'Ubuntu 22.04.5 LTS x86_64',
-      host: 'Google Compute Engine',
-      kernel: '6.18.15 cloud-amd64',
-      cpu: 'Xeon Platinum 8581C (32)',
-      ram: '258GB DDR5',
-      disk: 'NVMe SSD',
-      uptime: '47+ hari nonstop',
+      os: os || 'linux (x64)',
+      host: 'VPS NAT Store',
+      kernel: '5.15.0-190-generic',
+      cpu: 'Xeon E5-2690 v4 (16)',
+      ram: '62.88 GB',
+      disk: '342.9 GB',
+      uptime: '18+ hari nonstop',
     };
     return await sharp(Buffer.from(specSvg({ rows, pingVps, pingBot: null, stock }))).png().toBuffer();
   } catch (e) { console.error('Gagal bikin kartu spek:', e.message); return null; }
@@ -1451,8 +1463,8 @@ function menuCaption(name, balance, otpBal, remaining, total, percent, dot, empt
 
 const START_VIDEO_URL = process.env.START_VIDEO_URL || 'https://files.catbox.moe/xhuon5.mp4';
 
-// Menu /start: video pembuka TANPA tombol, lalu 1 pesan teks menu + tombol.
-// (Caption + tombol dalam 1 card bikin tombol kelihatan "nembus" / ga sejajar.)
+// Menu /start: video pembuka, lalu kartu spek, lalu 1 pesan teks menu + tombol.
+// Media TANPA tombol biar ga kelihatan "nembus" / ga sejajar.
 async function sendStartMenu(ctx, name, chatId) {
   const { text, buttons } = await buildStart(name, chatId);
   if (START_VIDEO_URL) {
@@ -1462,23 +1474,11 @@ async function sendStartMenu(ctx, name, chatId) {
         { caption: `${config.shopName}\nHalo, ${name}!`, supports_streaming: true }
       );
     } catch {}
-  } else {
-    const remaining = await getStockCount();
-    const balance = chatId ? await getBalance(chatId) : 0;
-    const otpBal = chatId ? await getOtpBalance(chatId) : 0;
-    const total = config.stockTotal > 0 ? config.stockTotal : Math.max(remaining, 1);
-    const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
-    const dot = remaining < 1 ? '🔴' : percent < 30 ? '🟡' : '🟢';
-    const photo = await specPhoto();
-    if (photo) {
-      try {
-        await ctx.replyWithPhoto(
-          { source: photo },
-          { caption: menuCaption(name, balance, otpBal, remaining, total, percent, dot, remaining < 1) }
-        );
-      } catch {}
-    }
   }
+  try {
+    const photo = await specPhoto();
+    if (photo) await ctx.replyWithPhoto({ source: photo });
+  } catch {}
   await ctx.reply(text, buttons);
 }
 
