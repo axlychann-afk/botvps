@@ -97,6 +97,91 @@ function isDoubleStart(uid) {
 let stockLock = Promise.resolve();
 const pollTimers = new Map();
 
+// ---- Anti double-tap global + mode input tahan restart ----
+// 1. Retry Telegram kadang kirim callback_query yang sama 2x (id sama) -> buang.
+// 2. Double-tap tombol menu dalam 3 detik ->ISTOP, cukup 1 balasan (sumber "2 menu").
+// 3. Mode input (ketik nominal / username panel / pilih bayar panel / contact)
+//    disimpan ke disk tiap ada update, jadi habis restart bot tetap nyambung.
+const seenCallbacks = new Map(); // callback id -> timestamp ms
+const menuCooldown = new Map(); // userId:data -> timestamp ms
+const MENU_COOLDOWN_MS = 3000;
+const pendingInputFile = path.join(dataDir, 'pending_input.json');
+let saveInputTimer = null;
+
+function scheduleInputSave() {
+  try {
+    if (saveInputTimer) clearTimeout(saveInputTimer);
+  } catch {}
+  saveInputTimer = setTimeout(() => { savePendingInput(); }, 500);
+  if (saveInputTimer && typeof saveInputTimer.unref === 'function') {
+    try { saveInputTimer.unref(); } catch {}
+  }
+}
+
+function savePendingInput() {
+  try {
+    const data = {
+      topup: Object.fromEntries(pendingTopupCustom),
+      panelUser: Object.fromEntries(panelWaitUsername),
+      panelPay: Object.fromEntries(pendingPanelPay),
+      contact: [...pendingContact],
+    };
+    writeJson(pendingInputFile, data).catch(() => {});
+  } catch {}
+}
+
+async function loadPendingInput() {
+  try {
+    const g = await readJson(pendingInputFile);
+    if (g && typeof g === 'object') {
+      for (const [k, v] of Object.entries(g.topup || {})) pendingTopupCustom.set(String(k), String(v));
+      for (const [k, v] of Object.entries(g.panelUser || {})) panelWaitUsername.set(String(k), String(v));
+      for (const [k, v] of Object.entries(g.panelPay || {})) {
+        if (v && typeof v === 'object') pendingPanelPay.set(String(k), v);
+      }
+      for (const u of g.contact || []) pendingContact.add(String(u));
+    }
+  } catch {}
+}
+
+function pruneSeenMaps(now) {
+  if (seenCallbacks.size > 2000) {
+    for (const [k, v] of seenCallbacks) if (now - v > 120000) seenCallbacks.delete(k);
+  }
+  if (menuCooldown.size > 2000) {
+    for (const [k, v] of menuCooldown) if (now - v > 30000) menuCooldown.delete(k);
+  }
+}
+
+bot.use(async (ctx, next) => {
+  try {
+    const cq = ctx.callbackQuery;
+    if (cq && cq.id) {
+      const now = Date.now();
+      if (seenCallbacks.has(cq.id)) {
+        await ctx.answerCbQuery().catch(() => {});
+        return;
+      }
+      seenCallbacks.set(cq.id, now);
+      const data = typeof cq.data === 'string' ? cq.data : '';
+      // Tombol cek/batal pembayaran boleh di-tap ulang (status live), lainnya cooldown.
+      if (data && !/^(check:|cancel:)/.test(data)) {
+        const key = `${ctx.from?.id || ''}:${data}`;
+        const prev = menuCooldown.get(key) || 0;
+        if (now - prev < MENU_COOLDOWN_MS) {
+          await ctx.answerCbQuery().catch(() => {});
+          return;
+        }
+        menuCooldown.set(key, now);
+      }
+      pruneSeenMaps(now);
+    }
+    await next();
+  } finally {
+    scheduleInputSave();
+  }
+});
+
 // ---- Panel Legal (bayar QRIS otomatis, delivery manual via admin) ----
 const PANEL_PLANS = [
   { id: '1', label: '1 GB • 1024 MB • 1024 MB • 40%', price: 1000 },
@@ -309,6 +394,21 @@ function getChatId(ctx) {
   return ctx.chat?.id ?? ctx.from?.id;
 }
 
+// Fetch dengan timeout: tanpa ini, API yang hang bikin antrian pay per chat
+// macet selamanya -> semua tombol user itu jadi "ga jawab".
+async function fetchWithTimeout(url, opts = {}, ms = 25000, label = 'API') {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms);
+  try {
+    return await fetch(url, { ...opts, signal: ctl.signal });
+  } catch (e) {
+    if (e?.name === 'AbortError') throw new Error(`${label} timeout (${Math.round(ms / 1000)} dtk). Coba lagi.`);
+    throw e;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 async function createQris(nominal = PRICE) {
   const bodyStr = JSON.stringify({ amount: Number(nominal) });
   let url = config.topupUrl;
@@ -319,11 +419,11 @@ async function createQris(nominal = PRICE) {
   } else {
     url = paymentKeyQuery(url);
   }
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     method: 'POST',
     headers,
     body: bodyStr,
-  });
+  }, 25000, 'QRIS');
   const body = await response.json().catch(() => ({}));
   if (response.status === 429)
     throw new Error('Terlalu sering bikin QR. Tunggu sebentar lalu buat lagi.');
@@ -363,7 +463,7 @@ async function checkPayment(order) {
   } else {
     url = paymentKeyQuery(url);
   }
-  const response = await fetch(url, { method: 'GET', ...(headers ? { headers } : {}) });
+  const response = await fetchWithTimeout(url, { method: 'GET', ...(headers ? { headers } : {}) }, 20000, 'Status QRIS');
   const body = await response.json().catch(() => ({}));
   if (response.status === 404) return false; // transaksi tak ada = belum bayar / salah id
   if (!response.ok) throw new Error(body.message || body.error || `Status QRIS HTTP ${response.status}`);
@@ -384,7 +484,7 @@ async function cancelPayment(order) {
   } else {
     url = paymentKeyQuery(url);
   }
-  const response = await fetch(url, { method: 'POST', ...(headers ? { headers } : {}) });
+  const response = await fetchWithTimeout(url, { method: 'POST', ...(headers ? { headers } : {}) }, 20000, 'Cancel QRIS');
   const body = await response.json().catch(() => ({}));
   if (!response.ok && response.status !== 400)
     throw new Error(body.message || body.error || `Cancel QRIS HTTP ${response.status}`);
@@ -475,9 +575,15 @@ async function isJoinedTesti(userId) {
   const gid = await getTestiId();
   if (!gid) return true; // fitur mati kalau ID belum diset
   try {
-    const m = await bot.telegram.getChatMember(gid, userId);
+    // getChatMember dibatasi 10 dtk: kalau Telegram lemot, jangan kunci user
+    // di gate (dicek lagi pas bayar), biar tombol ga kelihatan mati.
+    const m = await Promise.race([
+      bot.telegram.getChatMember(gid, userId),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('__timeout__')), 10000)),
+    ]);
     return ['creator', 'administrator', 'member', 'restricted'].includes(m?.status);
-  } catch {
+  } catch (e) {
+    if (e?.message === '__timeout__') return true;
     return false; // bot belum masuk grup / ID salah -> anggap belum join biar ketahuan
   }
 }
@@ -1185,7 +1291,11 @@ async function buildStart(name, chatId) {
   const otpBal = chatId ? await getOtpBalance(chatId) : 0;
   let ping = null;
   try {
-    await bot.telegram.getMe();
+    // getMe dibatasi 8 dtk biar /start ga hang kalau Telegram lemot.
+    await Promise.race([
+      bot.telegram.getMe(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000)),
+    ]);
     ping = Date.now() - t0;
   } catch { ping = null; }
   // Spek live dari data stok: OS unit pertama + ping TCP ke IP stok pertama.
@@ -1424,6 +1534,8 @@ function qrisExpiryText(qris) {
 }
 
 bot.action('buy', async (ctx) => {
+  // Ack duluan biar tombol ga kelihatan mati kalau antrian lagi sibuk.
+  await ctx.answerCbQuery().catch(() => {});
   await withPayLock(getChatId(ctx), async () => {
   try {
     if (!(await isJoinedTesti(ctx.from.id))) {
@@ -1594,6 +1706,7 @@ async function checkDeposit(order) {
 
 // ---- Beli pakai saldo ----
 bot.action('buy_balance', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
   if (!(await isJoinedTesti(ctx.from.id))) {
     await ctx.answerCbQuery('Gabung GB Testimoni dulu!');
     await ctx.reply(`⚠️ Wajib gabung GB Testimoni dulu sebelum order:\n👉 ${config.testiLink}`, joinGateButtons()).catch(() => {});
@@ -2299,6 +2412,7 @@ bot.action('panel_legal', async (ctx) => {
 
 // User klik paket -> minta username (dikunci anti-QR-ganda kayak order lain)
 bot.action(/^pbuy:(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
   const plan = panelPlanById(ctx.match[1]);
   if (!plan) return ctx.answerCbQuery('Paket tidak valid.');
   const chatId = getChatId(ctx);
@@ -2354,7 +2468,11 @@ bot.on('text', async (ctx, next) => {
     }
     pendingTopupCustom.delete(chatKey);
     if (!nokosOn()) { await ctx.reply('❌ Top up belum aktif. Hubungi admin.'); return; }
-    await doTopupOtpOrder(ctx, nominal);
+    try {
+      await doTopupOtpOrder(ctx, nominal);
+    } catch (e) {
+      await ctx.reply(`❌ Gagal bikin QRIS: ${e?.message || e}. Coba lagi atau /batal.`);
+    }
   } catch { try { await next(); } catch {} }
 });
 
@@ -2392,6 +2510,7 @@ bot.on('text', async (ctx, next) => {
 
 // ---- Eksekusi bayar panel: QRIS vs Saldo ----
 bot.action('ppay:qris', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
   const chatKey = String(getChatId(ctx));
   const pend = pendingPanelPay.get(chatKey);
   if (!pend) return ctx.answerCbQuery('Pilihan kedaluwarsa. Ulangi dari menu panel.');
@@ -2965,6 +3084,7 @@ bot.command('tambahsaldo', async (ctx) => {
 // ---- Start ----
 try {
   await ensureData();
+  await loadPendingInput();
 } catch (e) {
   console.error(`Gagal start: ${e.message}`);
   process.exit(1);
