@@ -1463,7 +1463,7 @@ async function sendStartMenu(ctx, name, chatId) {
   const caption = menuCaption(name, balance, otpBal, remaining, total, percent, dot, remaining < 1);
   if (START_VIDEO_URL) {
     try {
-      await ctx.replyWithVideo({ url: START_VIDEO_URL }, { caption, ...buttons });
+      await ctx.replyWithVideo({ url: START_VIDEO_URL }, { caption, supports_streaming: true, ...buttons });
       return;
     } catch {}
   }
