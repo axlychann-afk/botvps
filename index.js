@@ -1461,22 +1461,16 @@ function menuCaption(name, balance, otpBal, remaining, total, percent, dot, empt
 
 const START_VIDEO_URL = process.env.START_VIDEO_URL || 'https://files.catbox.moe/sausq2.mp4';
 
-// Menu /start: video 960x600 (seukuran kartu spek) + caption + tombol, 1 pesan.
+// Menu /start: video 960x600 + teks LENGKAP + tombol, 1 pesan.
 // Fallback teks bila video gagal.
 async function sendStartMenu(ctx, name, chatId) {
   const { text, buttons } = await buildStart(name, chatId);
   if (START_VIDEO_URL) {
     try {
-      const remaining = await getStockCount();
-      const balance = chatId ? await getBalance(chatId) : 0;
-      const otpBal = chatId ? await getOtpBalance(chatId) : 0;
-      const total = config.stockTotal > 0 ? config.stockTotal : Math.max(remaining, 1);
-      const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
-      const dot = remaining < 1 ? '🔴' : percent < 30 ? '🟡' : '🟢';
       await ctx.replyWithVideo(
         { url: START_VIDEO_URL },
         {
-          caption: menuCaption(name, balance, otpBal, remaining, total, percent, dot, remaining < 1),
+          caption: text.slice(0, 1024),
           supports_streaming: true,
           ...buttons,
         }
