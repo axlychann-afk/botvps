@@ -1578,8 +1578,10 @@ async function dropMsg(ctx, m) {
 const lastMenu = new Map(); // chatKey -> { chat, mid, kind: 'video' | 'text' }
 function startMenuRefresh(chatId, cid, mid, name, buttons, kind = 'video') {
   try {
-    let ticks = 0, fails = 0;
+    let ticks = 0, fails = 0, busy = false;
     const timer = setInterval(async () => {
+      if (busy) return; // build sebelumnya belum kelar -> skip, jangan numpuk
+      busy = true;
       ticks++;
       if (ticks > 40) { clearInterval(timer); return; } // 40x3 dtk = 2 menit
       try {
@@ -1593,9 +1595,11 @@ function startMenuRefresh(chatId, cid, mid, name, buttons, kind = 'video') {
         }
         fails = 0;
       } catch (e) {
-        if (String(e?.message || '').includes('not modified')) return;
+        if (String(e?.message || '').includes('not modified')) { busy = false; return; }
+        console.error(`Refresh menu ${mid} gagal (${fails + 1}/3):`, e?.message || e);
         if (++fails >= 3) clearInterval(timer);
       }
+      busy = false;
     }, 3000);
     if (timer && typeof timer.unref === 'function') {
       try { timer.unref(); } catch {}
