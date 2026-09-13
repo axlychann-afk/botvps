@@ -184,41 +184,73 @@ bot.use(async (ctx, next) => {
 
 // ---- Panel Legal (bayar QRIS otomatis, delivery manual via admin) ----
 const PANEL_PLANS = [
-  { id: '1', label: '1 GB • 1024 MB • 1024 MB • 40%', price: 1000 },
-  { id: '2', label: '2 GB • 2048 MB • 2048 MB • 60%', price: 2000 },
-  { id: '3', label: '3 GB • 3072 MB • 3072 MB • 80%', price: 3000 },
-  { id: '4', label: '4 GB • 4096 MB • 4096 MB • 100%', price: 4000 },
-  { id: '5', label: '5 GB • 5120 MB • 5120 MB • 110%', price: 5000 },
-  { id: '6', label: '6 GB • 6144 MB • 6144 MB • 120%', price: 6000 },
-  { id: '7', label: '7 GB • 7168 MB • 7168 MB • 130%', price: 7000 },
-  { id: '8', label: '8 GB • 8192 MB • 8192 MB • 140%', price: 8000 },
-  { id: '9', label: '9 GB • 9216 MB • 9216 MB • 150%', price: 9000 },
-  { id: '10', label: '10 GB • 10240 MB • 10240 MB • 200%', price: 10000 },
-  { id: 'unli', label: 'Unlimited • ∞ • ∞ • ∞', price: 15000 },
+  { id: 'unli', label: 'Unlimited • ∞ • ∞ • ∞', price: 10000 },
 ];
 // chatId -> planId yang lagi nunggu input username
 const panelWaitUsername = new Map();
 // chatId -> { planId, username } yang lagi pilih metode bayar
 const pendingPanelPay = new Map();
 
+// ---- Stok panel (1 angka buat semua plan, normal 10) ----
+const panelStockFile = path.join(dataDir, 'panel_stock.json');
+const PANEL_STOCK_DEFAULT = 10;
+async function getPanelStock() {
+  try {
+    const g = await readJson(panelStockFile);
+    const n = Math.floor(Number(g?.stock));
+    if (Number.isFinite(n) && n >= 0) return n;
+  } catch {}
+  return PANEL_STOCK_DEFAULT;
+}
+async function setPanelStock(n) {
+  n = Math.max(0, Math.floor(Number(n) || 0));
+  await writeJson(panelStockFile, { stock: n });
+  return n;
+}
+async function addPanelStock(delta) {
+  const cur = await getPanelStock();
+  return setPanelStock(cur + Math.trunc(Number(delta) || 0));
+}
+async function decPanelStock() {
+  const cur = await getPanelStock();
+  if (cur <= 0) return 0;
+  return setPanelStock(cur - 1);
+}
+
 function panelPlanById(id) {
   return PANEL_PLANS.find((p) => p.id === String(id));
 }
 
-function panelListKeyboard() {
+async function panelListKeyboard() {
+  const stock = await getPanelStock();
   const rows = [];
-  for (const p of PANEL_PLANS) {
-    rows.push([Markup.button.callback(`📦 ${p.label} — ${formatRupiah(p.price)}`, `pbuy:${p.id}`)]);
+  if (stock < 1) {
+    rows.push([Markup.button.callback('❌ Stok Panel Habis', 'panel_empty')]);
+  } else {
+    for (const p of PANEL_PLANS) {
+      rows.push([Markup.button.callback(`📦 ${p.label} — ${formatRupiah(p.price)} (Sisa ${stock})`, `pbuy:${p.id}`)]);
+    }
   }
   rows.push([Markup.button.callback('⬅️ Kembali', 'cek_stok')]);
   return Markup.inlineKeyboard(rows);
 }
 
-function panelIntroText() {
+async function panelIntroText() {
+  const stock = await getPanelStock();
   const list = PANEL_PLANS.map((p) => `• ${p.label} — ${formatRupiah(p.price)}`).join('\n');
   return `🛡️ PANEL LEGAL — FULL GARANSI 30 HARI ✅\n\n` +
     `Panel ini LEGAL 100%.\n` +
-    `Baal? Ganti baru / ON 30 DAY FULL GARANSI.\n\n` +
+    `Baal? Ganti baru / ON 30 DAY FULL GARANSI.\n` +
+    `Down lebih dari 6 hari? Dana kembali (refund).\n\n` +
+    `📦 Stok panel: ${stock < 1 ? 'HABIS — tunggu restock ya 🙏' : `${stock} ready`}\n\n` +
+    `🖥️ Spesifikasi Server:\n` +
+    `• OS: linux (x64)\n` +
+    `• Kernel: 5.15.0-190-generic\n` +
+    `• CPU: Intel(R) Xeon(R) CPU E5-2690 v4 @ 2.60GHz\n` +
+    `• Threads: 16\n` +
+    `• RAM: 62.88 GB\n` +
+    `• Disk: 342.9 GB\n` +
+    `• Uptime: 18 hari, 18 jam, 10 menit\n\n` +
     `📋 List Panel:\n${list}\n\n` +
     `👇 Pilih salah satu di bawah, lalu masukkan username panel yang kamu mau.`;
 }
@@ -239,6 +271,16 @@ async function afterPanelPaid(order) {
       `✅ Pembayaran berhasil!\n📦 Panel ${planLabel} (${order.panelUsername || '-'})\n\nPesanan akan diproses, tunggu balasan admin ya 🙏`
     );
   } catch {}
+  // Stok panel ngurang otomatis sekali per order lunas (saldo maupun QRIS).
+  try {
+    const orders = await readJson(ordersFile);
+    const o = orders?.[order?.id];
+    if (o && o.kind === 'panel' && !o.stockDecremented) {
+      o.stockDecremented = true;
+      await writeJson(ordersFile, orders);
+      await decPanelStock();
+    }
+  } catch {}
 }
 
 // ---- Helpers file ----
@@ -258,6 +300,11 @@ async function ensureData() {
     await access(groupsFile, constants.F_OK);
   } catch {
     await writeJson(groupsFile, {});
+  }
+  try {
+    await access(panelStockFile, constants.F_OK);
+  } catch {
+    await writeJson(panelStockFile, { stock: PANEL_STOCK_DEFAULT });
   }
   try {
     await access(stockFile, constants.F_OK);
@@ -2404,10 +2451,14 @@ async function forwardToAdmins(ctx, text, replyMsg) {
 bot.action('panel_legal', async (ctx) => {
   try {
     await ctx.answerCbQuery().catch(() => {});
-    await ctx.reply(panelIntroText(), panelListKeyboard());
+    await ctx.reply(await panelIntroText(), await panelListKeyboard());
   } catch {
     await ctx.answerCbQuery('Gagal buka menu panel.').catch(() => {});
   }
+});
+
+bot.action('panel_empty', async (ctx) => {
+  await ctx.answerCbQuery('Stok panel habis. Tunggu restock ya!').catch(() => {});
 });
 
 // User klik paket -> minta username (dikunci anti-QR-ganda kayak order lain)
@@ -2415,6 +2466,9 @@ bot.action(/^pbuy:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const plan = panelPlanById(ctx.match[1]);
   if (!plan) return ctx.answerCbQuery('Paket tidak valid.');
+  if ((await getPanelStock()) < 1) {
+    return ctx.answerCbQuery('Stok panel habis. Tunggu restock ya!').catch(() => {});
+  }
   const chatId = getChatId(ctx);
   const dup = await findPendingPayment(chatId);
   if (dup) {
@@ -2438,6 +2492,33 @@ bot.action('panel_cancel_input', async (ctx) => {
   pendingPanelPay.delete(String(getChatId(ctx)));
   await ctx.answerCbQuery('Dibatalkan.').catch(() => {});
   await ctx.reply('❌ Input username dibatalkan. Balik ke /start kalau mau mulai lagi.');
+});
+
+// Format: /stockpanel            -> lihat stok
+//         /stockpanel -2         -> kurangi 2
+//         /stockpanel 3 / +3     -> tambah 3 (tanpa tanda = nambah)
+//         /stockpanel set 10     -> set langsung ke 10
+bot.command('stockpanel', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const arg = (ctx.message?.text || '').replace(/^\/stockpanel(@\w+)?/, '').trim();
+  if (!arg) {
+    await ctx.reply(`📦 Stok panel: ${await getPanelStock()}`);
+    return;
+  }
+  let m = arg.match(/^set\s+(\d+)$/i);
+  if (m) {
+    const n = await setPanelStock(Number(m[1]));
+    await ctx.reply(`✅ Stok panel di-set ke ${n}.`);
+    return;
+  }
+  m = arg.match(/^([+-]?)(\d+)$/);
+  if (!m) {
+    await ctx.reply('Format:\n/stockpanel\n/stockpanel -2\n/stockpanel 3\n/stockpanel set 10');
+    return;
+  }
+  const delta = m[1] === '-' ? -Number(m[2]) : Number(m[2]);
+  const n = await addPanelStock(delta);
+  await ctx.reply(`✅ Stok panel ${delta < 0 ? delta : `+${delta}`} → sekarang ${n}.`);
 });
 
 bot.command('batal', async (ctx) => {
