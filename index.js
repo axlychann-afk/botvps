@@ -1150,18 +1150,24 @@ async function buildStart(name, chatId) {
     ping === null ? '│  • Ping Bot  :  —' : `│  • Ping Bot  :  ${ping} ms 🟢`,
   ].filter(Boolean).join('\n');
   const text =
-    `✦ ${config.shopName} ✦\n` +
-    `Halo, ${name}! 👋\n\n` +
+    `✦ ${config.shopName} ✦  🆕\n` +
+    `Halo, ${name}! 👋\n` +
+    `\n` +
     `━━━━━━━━━━━━━━━\n` +
     `💰 Saldo VPS  :  ${formatRupiah(balance)}\n` +
+    `\n` +
     `📱 Saldo OTP  :  ${formatRupiah(otpBal)}\n` +
     `━━━━━━━━━━━━━━━\n\n` +
-    `🖥️ VPS NAT — ${formatRupiah(UNIT_PRICE)} / unit\n\n` +
+    `🖥️ VPS NAT — ${formatRupiah(UNIT_PRICE)} / unit\n` +
+    `\n` +
     `📦 Spesifikasi Host :\n` +
-    `${specLines ? specLines + '\n' : ''}\n` +
+    `${specLines ? specLines + '\n' : ''}` +
+    `\n` +
     `📡 Spek Live :\n` +
-    `${liveLines ? liveLines + '\n' : ''}\n` +
-    `└ ${config.productSpec}\n\n` +
+    `${liveLines ? liveLines + '\n' : ''}` +
+    `\n` +
+    `└ ${config.productSpec}\n` +
+    `\n` +
     `━━━━━━━━━━━━━━━\n` +
     `📊 Stok  :  ${dot} ${remaining}/${total}  ${stockBar(percent)}  (${percent}%)\n` +
     (empty ? `\n❌ Stok habis — coba lagi nanti ya kak 🙏\n` : ``) +
@@ -1217,11 +1223,15 @@ async function specPhoto() {
 // Teks menu versi caption foto (1024 char max) — spek detail ada di gambar, di sini ringkas.
 function menuCaption(name, balance, otpBal, remaining, total, percent, dot, empty) {
   return (
-    `✦ ${config.shopName} ✦\n` +
-    `Halo, ${name}! 👋\n\n` +
+    `✦ ${config.shopName} ✦  🆕\n` +
+    `Halo, ${name}! 👋\n` +
+    `\n` +
     `💰 Saldo VPS  :  ${formatRupiah(balance)}\n` +
+    `\n` +
     `📱 Saldo OTP  :  ${formatRupiah(otpBal)}\n` +
-    `📦 Harga  :  1 VPS = ${formatRupiah(UNIT_PRICE)}\n\n` +
+    `\n` +
+    `📦 Harga  :  1 VPS = ${formatRupiah(UNIT_PRICE)}\n` +
+    `\n` +
     `📊 Stok  :  ${dot} ${remaining}/${total} (${percent}%)  ${stockBar(percent)}\n` +
     (empty ? `\n❌ Stok habis — coba lagi nanti ya kak 🙏\n` : ``) +
     `\n⚡ Auto-order setelah bayar\n🔒 Testimoni di channel`
@@ -1287,7 +1297,11 @@ async function showSaldo(ctx) {
   const balance = await getBalance(chatId);
   const otpBal = await getOtpBalance(chatId);
   await ctx.reply(
-    `🖥️ Saldo VPS: ${formatRupiah(balance)}\n📱 Saldo OTP: ${formatRupiah(otpBal)}\n\n1 VPS = ${formatRupiah(PRICE)}. Nokos mulai ~Rp1.600 pakai Saldo OTP.`,
+    `🖥️ Saldo VPS  :  ${formatRupiah(balance)}\n` +
+    `\n` +
+    `📱 Saldo OTP  :  ${formatRupiah(otpBal)}\n` +
+    `\n` +
+    `1 VPS = ${formatRupiah(PRICE)}. Nokos mulai ~Rp1.600 pakai Saldo OTP.`,
     Markup.inlineKeyboard([
       [Markup.button.callback('➕ Top Up (VPS/OTP)', 'topup')],
       [Markup.button.callback(`💰 Beli 1 VPS — ${formatRupiah(PRICE)}`, 'buy_balance')],
@@ -2934,7 +2948,7 @@ getSharp().then((s) =>
 // dan kalau token dipakai di 2 tempat (VPS + localhost) bakal 409 Conflict.
 // Pakai then/catch biar error tetap kelihatan.
 bot.launch()
-  .then(() => console.log('Bot aktif'))
+  .then(() => console.log('Bot aktif — MENU BUILD v2 (os-badge + teks spasi)'))
   .catch((e) => {
     console.error(`Gagal launch Telegram: ${e.message}`);
     console.error('Kemungkinan: BOT_TOKEN salah, atau bot sudah jalan di tempat lain (matikan dulu di VPS kalau mau test localhost).');
