@@ -79,6 +79,21 @@ const config = {
 };
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
+// Anti-double /start: Telegram kadang kirim update 2x (retry client),
+// atau bot jalan 2 instance (VPS + localhost). Abaikan /start yang sama
+// dari user yang sama dalam 5 detik.
+const lastStartAt = new Map();
+function isDoubleStart(uid) {
+  const now = Date.now();
+  const prev = lastStartAt.get(String(uid)) || 0;
+  if (now - prev < 5000) return true;
+  lastStartAt.set(String(uid), now);
+  // cegah Map bocor: bersihkan entri tua
+  if (lastStartAt.size > 500) {
+    for (const [k, v] of lastStartAt) if (now - v > 30000) lastStartAt.delete(k);
+  }
+  return false;
+}
 let stockLock = Promise.resolve();
 const pollTimers = new Map();
 
@@ -1239,6 +1254,8 @@ function menuCaption(name, balance, otpBal, remaining, total, percent, dot, empt
 }
 
 bot.start(async (ctx) => {
+  // DROP duplikat: /start ganda dalam 5 detik = kirim 1 menu aja
+  if (isDoubleStart(ctx.from?.id)) return;
   const name = ctx.from?.first_name || 'kak';
   const chatId = getChatId(ctx);
   // GATE: wajib gabung GB Testimoni dulu sebelum menu utama muncul
@@ -2175,6 +2192,8 @@ bot.action(/^cancel:(.+)$/, async (ctx) => {
 });
 
 bot.action('cek_join', async (ctx) => {
+  // tombol "Saya Sudah Gabung" di-spam 2x = 1 menu aja
+  if (isDoubleStart(`join:${ctx.from?.id}`)) { await ctx.answerCbQuery().catch(() => {}); return; }
   const joined = await isJoinedTesti(ctx.from.id);
   if (!joined) {
     await ctx.answerCbQuery('Kamu belum gabung. Join dulu ya!');
@@ -2946,9 +2965,11 @@ getSharp().then((s) =>
 
 // Jangan await launch: Telegraf long-polling tidak resolve selama jalan,
 // dan kalau token dipakai di 2 tempat (VPS + localhost) bakal 409 Conflict.
+// dropPendingUpdates:true = update /start lama yang numpuk pas restart
+// tidak di-replay (sumber "2 menu" paling sering selain double instance).
 // Pakai then/catch biar error tetap kelihatan.
-bot.launch()
-  .then(() => console.log('Bot aktif — MENU BUILD v2 (os-badge + teks spasi)'))
+bot.launch({ dropPendingUpdates: true })
+  .then(() => console.log('Bot aktif — MENU BUILD v2 (os-badge + teks spasi, anti-double-start)'))
   .catch((e) => {
     console.error(`Gagal launch Telegram: ${e.message}`);
     console.error('Kemungkinan: BOT_TOKEN salah, atau bot sudah jalan di tempat lain (matikan dulu di VPS kalau mau test localhost).');
