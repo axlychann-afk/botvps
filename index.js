@@ -630,11 +630,11 @@ async function isJoinedTesti(userId) {
   const gid = await getTestiId();
   if (!gid) return true; // fitur mati kalau ID belum diset
   try {
-    // getChatMember dibatasi 10 dtk: kalau Telegram lemot, jangan kunci user
+    // getChatMember dibatasi 5 dtk: kalau Telegram lemot, jangan kunci user
     // di gate (dicek lagi pas bayar), biar tombol ga kelihatan mati.
     const m = await Promise.race([
       bot.telegram.getChatMember(gid, userId),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('__timeout__')), 10000)),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('__timeout__')), 5000)),
     ]);
     return ['creator', 'administrator', 'member', 'restricted'].includes(m?.status);
   } catch (e) {
@@ -1617,7 +1617,7 @@ async function resendMenu(chatId, name) {
           { url: START_VIDEO_URL },
           { caption: videoCaption(text), supports_streaming: true, ...buttons }
         ),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('video-timeout')), 25000)),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('video-timeout')), 10000)),
       ]);
       if (sent?.message_id) {
         lastMenu.set(key, { chat: sent.chat.id, mid: sent.message_id, kind: 'video', text });
@@ -1733,7 +1733,12 @@ async function sendStartMenu(ctx, name, chatId) {
   const myGen = menuGen.get(key) || 0;
   let text, buttons;
   try {
-    ({ text, buttons } = await buildStart(name, chatId, { elapsedSec: 0, totalSec: 120 }));
+    // Guard 12 dtk: buildStart ada ping TCP + getMe, kalau Telegram lemot
+    // user nunggu tanpa feedback -> dikira "menu ga muncul".
+    ({ text, buttons } = await Promise.race([
+      buildStart(name, chatId, { elapsedSec: 0, totalSec: 120 }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('build-timeout')), 12000)),
+    ]));
   } catch (e) {
     console.error('buildStart /start gagal:', e?.message || e);
     text = `${config.shopName}\nHalo, ${name}!\nKetik /saldo buat cek saldo, /start buat menu.`;
@@ -1771,7 +1776,8 @@ async function sendStartMenu(ctx, name, chatId) {
             ...buttons,
           }
         ),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('video-timeout')), 25000)),
+        // 10 dtk cukup buat catbox; 25 dtk bikin user dikira "menu ga muncul".
+        new Promise((_, rej) => setTimeout(() => rej(new Error('video-timeout')), 10000)),
       ]);
       if (sent?.message_id) {
         // Hapus menu atas yang yatim biar cuma 1 menu — obat "yang atas yang ke-edit".
@@ -1817,7 +1823,7 @@ bot.start(async (ctx) => {
     );
     return;
   }
-  await sendStartMenu(ctx, name, chatId).catch(() => {});
+  await sendStartMenu(ctx, name, chatId).catch((e) => console.error('sendStartMenu gagal:', e?.message || e));
 });
 
 bot.action('cek_stok', async (ctx) => {
@@ -3538,6 +3544,41 @@ try {
 } catch (e) {
   console.error(`Gagal start: ${e.message}`);
   process.exit(1);
+}
+
+// ---- Dry-run: test menu /start tanpa konek Telegram ----
+// Cara: node index.js --dry-run
+// Build teks + caption persis kayak /start asli (ping di-cache biar offline),
+// cetak panjang + preview, exit. Dipakai buat buktiin "menu muncul" sebelum deploy.
+if (process.argv.includes('--dry-run')) {
+  pingCache.bot = 12;
+  pingCache.at = Date.now();
+  pingCache.vps = 34;
+  pingCache.vpsAt = Date.now();
+  try {
+    const { text } = await buildStart('Tester', '123', { elapsedSec: 3, totalSec: 120 });
+    const cap = videoCaption(text);
+    console.log(`DRY-RUN OK | text=${text.length} char | caption=${cap.length} char (limit 1024)`);
+    console.log('--- TEXT PREVIEW (500 char) ---');
+    console.log(text.slice(0, 500));
+    console.log('--- CAPTION PREVIEW ---');
+    console.log(cap.slice(0, 500));
+    if (cap.length > 1024) {
+      console.error('DRY-RUN GAGAL: caption > 1024 char, Telegram bakal nolak.');
+      process.exit(1);
+    }
+    const must = ['Spek Host Live', 'Uptime', 'Disk', 'Stok', 'update'];
+    const missing = must.filter((m) => !text.includes(m));
+    if (missing.length) {
+      console.error(`DRY-RUN GAGAL: teks kurang: ${missing.join(', ')}`);
+      process.exit(1);
+    }
+    console.log('DRY-RUN LULUS: semua blok live ada.');
+    process.exit(0);
+  } catch (e) {
+    console.error('DRY-RUN GAGAL:', e?.message || e);
+    process.exit(1);
+  }
 }
 
 await resumePolling();
