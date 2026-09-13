@@ -1665,6 +1665,9 @@ bot.start(async (ctx) => {
     return;
   }
   await sendStartMenu(ctx, name, chatId).catch(() => {});
+  // Overlap 1,5 dtk: stiker tetap mejeng sampai menu beneran nongol di layar,
+  // baru dihapus. Sambungan mulus, ga ada jeda kosong.
+  await new Promise((s) => setTimeout(s, 1500));
   await dropMsg(ctx, loadSticker);
 });
 
@@ -2550,7 +2553,8 @@ bot.action('cek_join', async (ctx) => {
   }
   await ctx.answerCbQuery('✅ Terima kasih sudah gabung!');
   const name = ctx.from?.first_name || 'kak';
-  await sendStartMenu(ctx, name, getChatId(ctx));
+  await sendStartMenu(ctx, name, getChatId(ctx)).catch(() => {});
+  await new Promise((s) => setTimeout(s, 1500));
   await dropMsg(ctx, loadSticker);
 });
 
