@@ -3372,17 +3372,19 @@ bot.command('tambahsaldo', async (ctx) => {
 // ---- Start ----
 const lockFile = path.join(dataDir, 'bot.lock');
 async function acquireLock() {
-  let old = null;
-  try { old = await readJson(lockFile); } catch {}
-  if (old && Number(old.pid) && Number(old.pid) !== process.pid) {
-    try {
-      process.kill(Number(old.pid), 0); // masih hidup?
-      console.error(`Bot sudah jalan (pid ${old.pid}). Matikan dulu proses lama sebelum start yang baru.`);
-      process.exit(1);
-    } catch {
-      // pid mati / tak bisa dicek -> ambil alih lock
+  // ADVISORY ONLY: jangan pernah exit gara-gara lock. Restart pm2 yang cepat
+  // bikin lock bekas masih ada + pid lama masih hidup sesaat — kalau exit di
+  // sini bot mati total. Double-instance (kalau beneran ada) cukup diteriakin
+  // di log, menu dobelnya ketahan dedup/cooldown.
+  try {
+    let old = null;
+    try { old = await readJson(lockFile); } catch {}
+    if (old && Number(old.pid) && Number(old.pid) !== process.pid) {
+      let alive = false;
+      try { process.kill(Number(old.pid), 0); alive = true; } catch {}
+      if (alive) console.error(`PERINGATAN: kemungkinan bot jalan 2x (pid lama ${old.pid}). Kalau menu dobel, matikan salah satunya.`);
     }
-  }
+  } catch {}
   try { await writeJson(lockFile, { pid: process.pid, startedAt: Date.now() }); } catch {}
 }
 async function releaseLock() {
