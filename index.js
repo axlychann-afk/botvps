@@ -1411,7 +1411,7 @@ async function buildStart(name, chatId) {
   const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
   const empty = remaining < 1;
   const dot = empty ? '🔴' : percent < 30 ? '🟡' : '🟢';
-  // Footer muter tiap refresh (3 dtk): 1 baris, gantian kayak uptime.
+  // Footer muter tiap detik: 1 baris, gantian tiap refresh.
   const footers = [
     `Auto-order setelah bayar, bukti otomatis di channel.`,
     `Butuh bantuan admin? /contact`,
@@ -1419,7 +1419,7 @@ async function buildStart(name, chatId) {
     `Tutor masang bot di VPS? /contact`,
     `VPS gabisa buat install panel/egg ya`,
   ];
-  const footer = footers[Math.floor(Date.now() / 3000) % footers.length];
+  const footer = footers[Math.floor(Date.now() / 1000) % footers.length];
   const specLines = config.vpsSpecs.map((s) => `• ${s}`).join('\n');
   const liveBits = [
     stockPing === null ? null : `Ping VPS ${stockPing}ms`,
@@ -1554,7 +1554,7 @@ function startMenuRefresh(chatId, cid, mid, name, buttons, kind = 'video') {
       if (busy) return;
       busy = true;
       ticks++;
-      if (ticks > 40) { clearInterval(timer); return; } // 40x3 dtk = 2 menit
+      if (ticks > 120) { clearInterval(timer); return; } // 120x1 dtk = 2 menit
       try {
         const fresh = await buildStart(name, chatId);
         if (kind === 'text') {
@@ -1571,7 +1571,7 @@ function startMenuRefresh(chatId, cid, mid, name, buttons, kind = 'video') {
         if (++fails >= 3) clearInterval(timer);
       }
       busy = false;
-    }, 3000);
+    }, 1000);
     if (timer && typeof timer.unref === 'function') {
       try { timer.unref(); } catch {}
     }
