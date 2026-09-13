@@ -1629,69 +1629,75 @@ function startMenuRefresh(chatId, name) {
     const timer = setInterval(async () => {
       if (busy) return;
       busy = true;
-      ticks++;
-      if (ticks > TOTAL) {
-        try {
-          const p = lastMenu.get(key);
-          if (p) lastMenu.set(key, { chat: p.chat, mid: p.mid, kind: p.kind, text: p.text });
-        } catch {}
-        clearInterval(timer);
-        busy = false;
-        return;
-      }
       try {
-        const { text, buttons } = await buildStart(name, chatId, { elapsedSec: ticks * 3, totalSec: 120 });
-        const prev = lastMenu.get(key);
-        if (prev && prev.mid) {
-          // Skip edit kalau isi beneran sama (hemat API), tapi karena ada
-          // jam+detik+countdown, ini jarang kejadian.
-          if (prev.text === text) { busy = false; return; }
+        ticks++;
+        if (ticks > TOTAL) {
           try {
-            if (prev.kind === 'text' || !START_VIDEO_URL) {
-              await bot.telegram.editMessageText(prev.chat, prev.mid, undefined, text, { ...buttons });
-              lastMenu.set(key, { chat: prev.chat, mid: prev.mid, kind: prev.kind || 'text', text, timer });
-            } else {
-              await bot.telegram.editMessageCaption(prev.chat, prev.mid, undefined, videoCaption(text), { ...buttons });
-              lastMenu.set(key, { chat: prev.chat, mid: prev.mid, kind: 'video', text, timer });
+            const p = lastMenu.get(key);
+            if (p) lastMenu.set(key, { chat: p.chat, mid: p.mid, kind: p.kind, text: p.text });
+          } catch {}
+          clearInterval(timer);
+          return;
+        }
+        try {
+          const { text, buttons } = await buildStart(name, chatId, { elapsedSec: ticks * 3, totalSec: 120 });
+          const prev = lastMenu.get(key);
+          if (prev && prev.mid) {
+            // Skip edit kalau isi beneran sama (hemat API), tapi karena ada
+            // jam+detik+countdown, ini jarang kejadian.
+            if (prev.text === text) return;
+            try {
+              if (prev.kind === 'text' || !START_VIDEO_URL) {
+                await bot.telegram.editMessageText(prev.chat, prev.mid, undefined, text, { ...buttons });
+                lastMenu.set(key, { chat: prev.chat, mid: prev.mid, kind: prev.kind || 'text', text, timer });
+              } else {
+                await bot.telegram.editMessageCaption(prev.chat, prev.mid, undefined, videoCaption(text), { ...buttons });
+                lastMenu.set(key, { chat: prev.chat, mid: prev.mid, kind: 'video', text, timer });
+              }
+            } catch (e) {
+              const msg = String(e?.message || e);
+              if (msg.includes('not modified')) return;
+              // Pesan dihapus / video kedaluwarsa -> kirim baru, jangan nunggu 3x gagal.
+              if (/deleted|not found|bad request|message to edit/i.test(msg)) {
+                await resendMenu(chatId, name);
+                const e2 = lastMenu.get(key) || {};
+                lastMenu.set(key, { chat: e2.chat, mid: e2.mid, kind: e2.kind, text: e2.text, timer });
+                fails = 0;
+                ticks = 0;
+                return;
+              }
+              throw e;
             }
-          } catch (e) {
-            const msg = String(e?.message || e);
-            if (msg.includes('not modified')) { busy = false; return; }
-            // Pesan dihapus / video kedaluwarsa -> kirim baru, jangan nunggu 3x gagal.
-            if (/deleted|not found|bad request|message to edit/i.test(msg)) {
+          } else {
+            await resendMenu(chatId, name);
+            const e2 = lastMenu.get(key) || {};
+            lastMenu.set(key, { chat: e2.chat, mid: e2.mid, kind: e2.kind, text: e2.text, timer });
+          }
+          fails = 0;
+        } catch (e) {
+          if (String(e?.message || '').includes('not modified')) return;
+          // 429 flood -> jangan resend brutal, tunggu tick berikut.
+          if (/429|too many|flood|retry after/i.test(String(e?.message || ''))) {
+            console.error(`Refresh menu ${chatId} kena rate-limit, skip tick ${ticks}`);
+            return;
+          }
+          console.error(`Refresh menu ${chatId} gagal (${fails + 1}/3):`, e?.message || e);
+          if (++fails >= 3) {
+            try {
               await resendMenu(chatId, name);
-              const e2 = lastMenu.get(key) || {};
-              lastMenu.set(key, { chat: e2.chat, mid: e2.mid, kind: e2.kind, text: e2.text, timer });
+              const e3 = lastMenu.get(key) || {};
+              lastMenu.set(key, { chat: e3.chat, mid: e3.mid, kind: e3.kind, text: e3.text, timer });
               fails = 0;
               ticks = 0;
-              busy = false;
-              return;
+            } catch (re) {
+              console.error(`Kirim ulang menu ${chatId} gagal:`, re?.message || re);
+              clearInterval(timer);
             }
-            throw e;
-          }
-        } else {
-          await resendMenu(chatId, name);
-          const e2 = lastMenu.get(key) || {};
-          lastMenu.set(key, { chat: e2.chat, mid: e2.mid, kind: e2.kind, text: e2.text, timer });
-        }
-        fails = 0;
-      } catch (e) {
-        if (String(e?.message || '').includes('not modified')) { busy = false; return; }
-        console.error(`Refresh menu ${chatId} gagal (${fails + 1}/3):`, e?.message || e);
-        if (++fails >= 3) {
-          try {
-            await resendMenu(chatId, name);
-            const e3 = lastMenu.get(key) || {};
-            lastMenu.set(key, { chat: e3.chat, mid: e3.mid, kind: e3.kind, text: e3.text, timer });
-            fails = 0;
-            ticks = 0;
-          } catch (re) {
-            console.error(`Kirim ulang menu ${chatId} gagal:`, re?.message || re);
-            clearInterval(timer);
           }
         }
+      } finally {
+        busy = false;
       }
-      busy = false;
     }, GAP);
     // NOTE: sengaja TANPA unref — unref bikin timer bisa mati di VPS idle,
     // itu salah satu penyebab "refresh ga jalan".
@@ -1712,6 +1718,10 @@ async function sendStartMenu(ctx, name, chatId) {
   }
   const prev = lastMenu.get(key);
   if (prev && prev.mid) {
+    // Matikan timer lama DULU sebelum timpa entry — kalau tidak,
+    // timer lama hidup terus + timer baru ikut edit pesan yg sama
+    // -> tabrakan -> flood -> refresh keliatan "stuck".
+    stopMenuRefresh(key);
     try {
       if (prev.kind === 'text' || !START_VIDEO_URL) {
         await ctx.telegram.editMessageText(prev.chat, prev.mid, undefined, text, { ...buttons });
@@ -1724,7 +1734,10 @@ async function sendStartMenu(ctx, name, chatId) {
       }
       startMenuRefresh(chatId, name);
       return;
-    } catch {}
+    } catch {
+      // Edit gagal (pesan dihapus) -> lanjut kirim baru di bawah,
+      // timer lama sudah dimatikan di atas jadi aman.
+    }
   }
   if (START_VIDEO_URL) {
     try {
