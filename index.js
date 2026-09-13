@@ -1446,7 +1446,11 @@ async function buildStart(name, chatId) {
     `────────────────\n` +
     `Stok ${dot} ${remaining}/${total} ${stockBar(percent)} ${percent}%\n` +
     (empty ? `Stok habis, coba lagi nanti ya kak.\n` : ``) +
-    `Auto-order setelah bayar, bukti otomatis di channel.`;
+    `Auto-order setelah bayar, bukti otomatis di channel.\n` +
+    `Butuh bantuan admin? /contact\n` +
+    `Gabisa masang bot? /contact aja\n` +
+    `Tutor masang bot di VPS? /contact\n` +
+    `VPS gabisa buat install panel/egg ya`;
   const rows = empty
     ? [[Markup.button.callback('🔄 Cek Stok', 'cek_stok')]]
     : [
