@@ -1408,6 +1408,15 @@ async function buildStart(name, chatId) {
   const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
   const empty = remaining < 1;
   const dot = empty ? '🔴' : percent < 30 ? '🟡' : '🟢';
+  // Footer muter tiap refresh (3 dtk): 1 baris, gantian kayak uptime.
+  const footers = [
+    `Auto-order setelah bayar, bukti otomatis di channel.`,
+    `Butuh bantuan admin? /contact`,
+    `Gabisa masang bot? /contact aja`,
+    `Tutor masang bot di VPS? /contact`,
+    `VPS gabisa buat install panel/egg ya`,
+  ];
+  const footer = footers[Math.floor(Date.now() / 3000) % footers.length];
   const specLines = config.vpsSpecs.map((s) => `• ${s}`).join('\n');
   const liveBits = [
     stockPing === null ? null : `Ping VPS ${stockPing}ms`,
@@ -1450,11 +1459,7 @@ async function buildStart(name, chatId) {
     `────────────────\n` +
     `Stok ${dot} ${remaining}/${total} ${stockBar(percent)} ${percent}%\n` +
     (empty ? `Stok habis, coba lagi nanti ya kak.\n` : ``) +
-    `Auto-order setelah bayar, bukti otomatis di channel.\n` +
-    `Butuh bantuan admin? /contact\n` +
-    `Gabisa masang bot? /contact aja\n` +
-    `Tutor masang bot di VPS? /contact\n` +
-    `VPS gabisa buat install panel/egg ya`;
+    footer;
   const rows = empty
     ? [[Markup.button.callback('🔄 Cek Stok', 'cek_stok')]]
     : [
