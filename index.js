@@ -126,10 +126,6 @@ function savePendingInput() {
       panelUser: Object.fromEntries(panelWaitUsername),
       panelPay: Object.fromEntries(pendingPanelPay),
       contact: [...pendingContact],
-      // timer sengaja TIDAK disimpan (Timeout object bikin JSON circular).
-      menu: Object.fromEntries(
-        [...lastMenu].map(([k, v]) => [k, { chat: v?.chat, mid: v?.mid, kind: v?.kind === 'text' ? 'text' : 'video' }])
-      ),
     };
     writeJson(pendingInputFile, data).catch(() => {});
   } catch {}
@@ -145,9 +141,6 @@ async function loadPendingInput() {
         if (v && typeof v === 'object') pendingPanelPay.set(String(k), v);
       }
       for (const u of g.contact || []) pendingContact.add(String(u));
-      for (const [k, v] of Object.entries(g.menu || {})) {
-        if (v && v.mid && v.chat) lastMenu.set(String(k), { chat: v.chat, mid: v.mid, kind: v.kind === 'text' ? 'text' : 'video' });
-      }
     }
   } catch {}
 }
@@ -1533,54 +1526,9 @@ const START_VIDEO_URL = process.env.START_VIDEO_URL || 'https://files.catbox.moe
 // bukan kirim baru ke bawah. ID menu disimpan (tahan restart).
 // Caption di-refresh tiap 3 detik (stat gerak sendiri, 2 menit pertama).
 // Fallback teks bila video gagal.
-// Menu /start: video + teks lengkap + tombol.
-// Menu /start: video + teks lengkap + tombol.
-// /start BERULANG ngedit pesan yang sama (anti-spam bawah).
-// Auto-refresh tiap 3 detik, 2 menit. Timer lama dimatikan tiap ada menu baru
-// (1 timer per chat, ga tabrakan). Timer TIDAK disimpan ke disk.
-const lastMenu = new Map(); // chatKey -> { chat, mid, kind, timer? }
-function stopMenuRefresh(key) {
-  try {
-    const p = lastMenu.get(String(key));
-    if (p && p.timer) clearInterval(p.timer);
-  } catch {}
-}
-function startMenuRefresh(chatId, cid, mid, name, buttons, kind = 'video') {
-  const key = String(chatId);
-  stopMenuRefresh(key);
-  try {
-    let ticks = 0, fails = 0, busy = false;
-    const timer = setInterval(async () => {
-      if (busy) return;
-      busy = true;
-      ticks++;
-      if (ticks > 120) { clearInterval(timer); return; } // 120x1 dtk = 2 menit
-      try {
-        const fresh = await buildStart(name, chatId);
-        if (kind === 'text') {
-          await bot.telegram.editMessageText(cid, mid, undefined, fresh.text, { ...buttons });
-        } else {
-          await bot.telegram.editMessageCaption(cid, mid, undefined, fresh.text.slice(0, 1024), {
-            ...buttons,
-          });
-        }
-        fails = 0;
-      } catch (e) {
-        if (String(e?.message || '').includes('not modified')) { busy = false; return; }
-        console.error(`Refresh menu ${mid} gagal (${fails + 1}/3):`, e?.message || e);
-        if (++fails >= 3) clearInterval(timer);
-      }
-      busy = false;
-    }, 1000);
-    if (timer && typeof timer.unref === 'function') {
-      try { timer.unref(); } catch {}
-    }
-    const cur = lastMenu.get(key) || {};
-    lastMenu.set(key, { chat: cur.chat ?? cid, mid: cur.mid ?? mid, kind, timer });
-  } catch {}
-}
+// Menu /start: video + teks lengkap + tombol, kirim baru tiap kali.
+// (Tanpa edit/refresh/stiker: simpel, pasti kekirim.)
 async function sendStartMenu(ctx, name, chatId) {
-  const key = String(chatId);
   let text, buttons;
   try {
     ({ text, buttons } = await buildStart(name, chatId));
@@ -1589,21 +1537,6 @@ async function sendStartMenu(ctx, name, chatId) {
     buttons = Markup.inlineKeyboard([
       [Markup.button.callback('🔄 Cek Stok', 'cek_stok')],
     ]);
-  }
-  const prev = lastMenu.get(key);
-  if (prev && prev.mid) {
-    try {
-      if (prev.kind === 'text' || !START_VIDEO_URL) {
-        await ctx.telegram.editMessageText(prev.chat, prev.mid, undefined, text, { ...buttons });
-        startMenuRefresh(chatId, prev.chat, prev.mid, name, buttons, 'text');
-      } else {
-        await ctx.telegram.editMessageCaption(prev.chat, prev.mid, undefined, text.slice(0, 1024), {
-          ...buttons,
-        });
-        startMenuRefresh(chatId, prev.chat, prev.mid, name, buttons, 'video');
-      }
-      return;
-    } catch {}
   }
   if (START_VIDEO_URL) {
     try {
@@ -1618,20 +1551,10 @@ async function sendStartMenu(ctx, name, chatId) {
         ),
         new Promise((_, rej) => setTimeout(() => rej(new Error('video-timeout')), 25000)),
       ]);
-      if (sent?.message_id) {
-        lastMenu.set(key, { chat: sent.chat.id, mid: sent.message_id, kind: 'video' });
-        startMenuRefresh(chatId, sent.chat.id, sent.message_id, name, buttons, 'video');
-      }
-      return;
+      if (sent?.message_id) return;
     } catch {}
   }
-  try {
-    const sentText = await ctx.reply(text, buttons);
-    if (sentText?.message_id) {
-      lastMenu.set(key, { chat: sentText.chat.id, mid: sentText.message_id, kind: 'text' });
-      startMenuRefresh(chatId, sentText.chat.id, sentText.message_id, name, buttons, 'text');
-    }
-  } catch {}
+  await ctx.reply(text, buttons).catch(() => null);
 }
 
 bot.start(async (ctx) => {
@@ -1657,27 +1580,9 @@ bot.start(async (ctx) => {
 bot.action('cek_stok', async (ctx) => {
   try {
     const name = ctx.from?.first_name || 'kak';
-    const chatId = getChatId(ctx);
-    const { text, buttons } = await buildStart(name, chatId);
+    const { text, buttons } = await buildStart(name, getChatId(ctx));
     await ctx.answerCbQuery();
-    const prev = lastMenu.get(String(chatId));
-    if (prev && prev.mid) {
-      try {
-        if (prev.kind === 'video') {
-          await ctx.telegram.editMessageCaption(prev.chat, prev.mid, undefined, text.slice(0, 1024), { ...buttons });
-          startMenuRefresh(chatId, prev.chat, prev.mid, name, buttons, 'video');
-        } else {
-          await ctx.telegram.editMessageText(prev.chat, prev.mid, undefined, text, { ...buttons });
-          startMenuRefresh(chatId, prev.chat, prev.mid, name, buttons, 'text');
-        }
-        return;
-      } catch {}
-    }
-    const sent = await ctx.reply(text, buttons);
-    if (sent?.message_id) {
-      lastMenu.set(String(chatId), { chat: sent.chat.id, mid: sent.message_id, kind: 'text' });
-      startMenuRefresh(chatId, sent.chat.id, sent.message_id, name, buttons, 'text');
-    }
+    await ctx.reply(text, buttons);
   } catch {
     await ctx.answerCbQuery('Gagal cek stok.');
   }
