@@ -1461,24 +1461,31 @@ function menuCaption(name, balance, otpBal, remaining, total, percent, dot, empt
   ).slice(0, 1000);
 }
 
-const START_VIDEO_URL = process.env.START_VIDEO_URL || 'https://files.catbox.moe/xhuon5.mp4';
+const START_VIDEO_URL = process.env.START_VIDEO_URL || 'https://files.catbox.moe/sausq2.mp4';
 
-// Menu /start: video pembuka, lalu kartu spek, lalu 1 pesan teks menu + tombol.
-// Media TANPA tombol biar ga kelihatan "nembus" / ga sejajar.
+// Menu /start: video 960x600 (seukuran kartu spek) + caption + tombol, 1 pesan.
+// Fallback teks bila video gagal.
 async function sendStartMenu(ctx, name, chatId) {
   const { text, buttons } = await buildStart(name, chatId);
   if (START_VIDEO_URL) {
     try {
+      const remaining = await getStockCount();
+      const balance = chatId ? await getBalance(chatId) : 0;
+      const otpBal = chatId ? await getOtpBalance(chatId) : 0;
+      const total = config.stockTotal > 0 ? config.stockTotal : Math.max(remaining, 1);
+      const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
+      const dot = remaining < 1 ? '🔴' : percent < 30 ? '🟡' : '🟢';
       await ctx.replyWithVideo(
         { url: START_VIDEO_URL },
-        { caption: `${config.shopName}\nHalo, ${name}!`, supports_streaming: true }
+        {
+          caption: menuCaption(name, balance, otpBal, remaining, total, percent, dot, remaining < 1),
+          supports_streaming: true,
+          ...buttons,
+        }
       );
+      return;
     } catch {}
   }
-  try {
-    const photo = await specPhoto();
-    if (photo) await ctx.replyWithPhoto({ source: photo });
-  } catch {}
   await ctx.reply(text, buttons);
 }
 
