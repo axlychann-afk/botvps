@@ -1591,6 +1591,9 @@ const START_VIDEO_URL = process.env.START_VIDEO_URL || 'https://files.catbox.moe
 // Auto-refresh tiap 3 detik (ping/RAM/Uptime/CPU gerak), 2 menit.
 // Pesan menu dihapus/kedaluwarsa -> dikirim BARU otomatis (ga ilang).
 // 1 timer per chat. Timer TIDAK disimpan ke disk.
+// Auto-refresh DIMATIKAN sementara (bikin /start error).
+// Set true kalau mau nyalakan lagi.
+const ENABLE_MENU_REFRESH = false;
 const lastMenu = new Map(); // chatKey -> { chat, mid, kind, text, timer, gen }
 const menuGen = new Map(); // chatKey -> nomor generasi (bunuh timer yatim)
 function stopMenuRefresh(key) {
@@ -1626,6 +1629,7 @@ async function resendMenu(chatId, name) {
   if (sentText?.message_id) lastMenu.set(key, { chat: sentText.chat.id, mid: sentText.message_id, kind: 'text', text });
 }
 function startMenuRefresh(chatId, name) {
+  if (!ENABLE_MENU_REFRESH) return;
   const key = String(chatId);
   stopMenuRefresh(key);
   const myGen = menuGen.get(key) || 0;
