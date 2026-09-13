@@ -1565,7 +1565,6 @@ function startMenuRefresh(chatId, cid, mid, name, buttons, kind = 'video') {
   } catch {}
 }
 async function sendStartMenu(ctx, name, chatId) {
-  const key = String(chatId);
   let text, buttons;
   try {
     ({ text, buttons } = await buildStart(name, chatId));
@@ -1598,26 +1597,10 @@ async function sendStartMenu(ctx, name, chatId) {
         ),
         new Promise((_, rej) => setTimeout(() => rej(new Error('video-timeout')), 25000)),
       ]);
-      if (sent?.message_id) {
-        lastMenu.set(key, { chat: sent.chat.id, mid: sent.message_id, kind: 'video' });
-        startMenuRefresh(chatId, sent.chat.id, sent.message_id, name, buttons, 'video');
-      }
-      return;
+      if (sent?.message_id) return;
     } catch {}
   }
-  const prevText = lastMenu.get(key);
-  if (prevText && prevText.kind === 'text') {
-    try {
-      await ctx.telegram.editMessageText(prevText.chat, prevText.mid, undefined, text, { ...buttons });
-      startMenuRefresh(chatId, prevText.chat, prevText.mid, name, buttons, 'text');
-      return;
-    } catch {}
-  }
-  const sentText = await ctx.reply(text, buttons).catch(() => null);
-  if (sentText?.message_id) {
-    lastMenu.set(key, { chat: sentText.chat.id, mid: sentText.message_id, kind: 'text' });
-    startMenuRefresh(chatId, sentText.chat.id, sentText.message_id, name, buttons, 'text');
-  }
+  await ctx.reply(text, buttons).catch(() => null);
 }
 
 bot.start(async (ctx) => {
