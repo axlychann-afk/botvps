@@ -1373,10 +1373,29 @@ async function pingVpsCached() {
   pingCache.vpsAt = now;
   return out;
 }
-// Disk live: df di linux, fallback statis biar ga hang.
+// Disk live: df di linux, wmic di windows, fallback statis biar ga hang.
 async function diskLive() {
   try {
     const { execFile } = await import('node:child_process');
+    // Windows: wmic (2 dtk timeout) — df ga ada di win32.
+    if (process.platform === 'win32') {
+      const out = await new Promise((resolve) => {
+        execFile('wmic', ['logicaldisk', 'C:', 'get', 'Size,FreeSpace', '/value'], { timeout: 2000 }, (e, stdout) => {
+          if (e) return resolve(null);
+          resolve(String(stdout || ''));
+        });
+      });
+      if (out) {
+        const free = Number((out.match(/FreeSpace=(\d+)/) || [])[1] || 0);
+        const size = Number((out.match(/Size=(\d+)/) || [])[1] || 0);
+        if (size > 0) {
+          const used = size - free;
+          const pct = Math.round((used / size) * 100);
+          return `${fmtGB(used)} / ${fmtGB(size)} (${pct}%)`;
+        }
+      }
+      return null;
+    }
     const out = await new Promise((resolve) => {
       execFile('df', ['-h', '/'], { timeout: 2000 }, (e, stdout) => {
         if (e) return resolve(null);
@@ -1593,19 +1612,36 @@ function videoDown() {
 function videoOk() { videoFails = 0; }
 function videoAlive() { return !START_VIDEO_URL || Date.now() >= videoDeadUntil; }
 
-// Menu /start: video + teks + tombol, kirim baru tiap kali.
-// (Refresh/edit/timer/stiker DIMATIKAN TOTAL biar normal.)
+// Registry menu /start yg lagi di-refresh realtime (1 timer per user).
+// key = chatId string -> { chat, mid, kind, timer }
+const lastMenu = new Map();
+function stopMenuRefresh(key) {
+  try {
+    const cur = lastMenu.get(String(key));
+    if (cur?.timer) clearInterval(cur.timer);
+    lastMenu.delete(String(key));
+  } catch {}
+}
+// Menu /start: kirim baru sekali, lalu edit teks/caption tiap 3 dtk (realtime).
+// Anti-stuck: busy-guard (tick ga numpuk), abaikan "not modified",
+// stop setelah 3 gagal BERUNTUN yg fatal (pesan dihapus / blocked),
+// stop otomatis 2 menit (40 tick). Timer lama selalu di-stop dulu.
 function startMenuRefresh(chatId, cid, mid, name, buttons, kind = 'video') {
-  return; // DIMATIKAN TOTAL (refresh bikin /start error) — timer ga dibuat sama sekali.
   const key = String(chatId);
   stopMenuRefresh(key);
+  if (!cid || !mid) return;
   try {
-    let ticks = 0, fails = 0, busy = false;
+    let ticks = 0, fails = 0, busy = false, stopped = false;
     const timer = setInterval(async () => {
-      if (busy) return;
+      if (busy || stopped) return;
       busy = true;
       ticks++;
-      if (ticks > 40) { clearInterval(timer); console.log(`Refresh menu ${chatId} selesai (2 mnt).`); return; } // 40x3 dtk = 2 menit
+      if (ticks > 40) {
+        clearInterval(timer);
+        lastMenu.delete(key);
+        console.log(`Refresh menu ${chatId} selesai (2 mnt).`);
+        return;
+      }
       try {
         const fresh = await buildStart(name, chatId, { elapsedSec: ticks * 3, totalSec: 120 });
         if (kind === 'text') {
@@ -1615,21 +1651,41 @@ function startMenuRefresh(chatId, cid, mid, name, buttons, kind = 'video') {
         }
         fails = 0;
       } catch (e) {
-        if (String(e?.message || '').includes('not modified')) { busy = false; return; }
-        console.error(`Refresh menu ${chatId} gagal (${fails + 1}/3):`, e?.message || e);
-        if (++fails >= 3) clearInterval(timer);
+        const msg = String(e?.message || e);
+        // "not modified" = isi tick sama persis (jarang, karena ada stamp detik) — bukan error, lanjut.
+        if (msg.includes('not modified') || msg.includes('message is not modified')) { busy = false; return; }
+        // Pesan dihapus / bot diblock / chat ga ketemu = stop permanen, jangan spam retry.
+        if (/not found|to edit not found|deleted|blocked|kicked|chat not found|message to edit/i.test(msg)) {
+          stopped = true;
+          clearInterval(timer);
+          lastMenu.delete(key);
+          console.log(`Refresh menu ${chatId} stop (pesan hilang/blocked).`);
+          busy = false;
+          return;
+        }
+        fails++;
+        console.error(`Refresh menu ${chatId} gagal (${fails}/5):`, msg);
+        if (fails >= 5) {
+          stopped = true;
+          clearInterval(timer);
+          lastMenu.delete(key);
+          console.log(`Refresh menu ${chatId} stop setelah 5 gagal beruntun.`);
+        }
       }
       busy = false;
     }, 3000);
     // SENGAJA tanpa unref: unref bikin timer mati kalau event-loop idle,
     // itu penyebab "refresh cuma jalan 1x" di VPS.
-    const cur = lastMenu.get(key) || {};
-    lastMenu.set(key, { chat: cur.chat ?? cid, mid: cur.mid ?? mid, kind, timer });
-  } catch {}
+    lastMenu.set(key, { chat: cid, mid, kind, timer });
+    console.log(`Refresh menu ${chatId} jalan (3 dtk, mid=${mid}, kind=${kind}).`);
+  } catch (e) {
+    console.error('startMenuRefresh gagal init:', e?.message || e);
+  }
 }
-// Tanpa edit/refresh/timer/stiker.
+// Kirim menu /start sekali + pasang timer realtime 3 dtk. Ga pernah throw.
 async function sendStartMenu(ctx, name, chatId) {
   const key = String(chatId);
+  stopMenuRefresh(key); // /start baru = timer lama dimatikan dulu biar ga dobel
   let text, buttons;
   try {
     // Guard 12 dtk: buildStart ada ping TCP + getMe, kalau Telegram lemot
@@ -1645,7 +1701,7 @@ async function sendStartMenu(ctx, name, chatId) {
       [Markup.button.callback('🔄 Cek Stok', 'cek_stok')],
     ]);
   }
-  // (Edit menu lama dihapus: selalu kirim baru.)
+  // (Selalu kirim baru — edit menu lama dihapus biar ga "message not found".)
   if (START_VIDEO_URL && videoAlive()) {
     try {
       const sent = await Promise.race([
@@ -1662,6 +1718,10 @@ async function sendStartMenu(ctx, name, chatId) {
       ]);
       if (sent?.message_id) {
         videoOk();
+        try {
+          const cid = sent.chat?.id ?? chatId;
+          startMenuRefresh(chatId, cid, sent.message_id, name, buttons, 'video');
+        } catch (e) { console.error('pasang refresh video gagal:', e?.message || e); }
         return;
       }
       console.error('kirim video menu: sent kosong, fallback teks.');
@@ -1671,7 +1731,13 @@ async function sendStartMenu(ctx, name, chatId) {
     }
   }
   try {
-    await ctx.reply(text, buttons);
+    const sent = await ctx.reply(text, buttons);
+    if (sent?.message_id) {
+      try {
+        const cid = sent.chat?.id ?? chatId;
+        startMenuRefresh(chatId, cid, sent.message_id, name, buttons, 'text');
+      } catch (e) { console.error('pasang refresh teks gagal:', e?.message || e); }
+    }
   } catch (e) {
     console.error('kirim teks menu gagal:', e?.message || e);
   }
@@ -1728,7 +1794,13 @@ bot.action('cek_stok', async (ctx) => {
     const chatId = getChatId(ctx);
     await ctx.answerCbQuery().catch(() => {});
     const { text, buttons } = await buildStart(name, chatId, { elapsedSec: 0, totalSec: 120 });
-    await ctx.reply(text, buttons);
+    const sent = await ctx.reply(text, buttons);
+    if (sent?.message_id) {
+      try {
+        const cid = sent.chat?.id ?? chatId;
+        startMenuRefresh(chatId, cid, sent.message_id, name, buttons, 'text');
+      } catch {}
+    }
   } catch (e) {
     console.error('cek_stok gagal:', e?.message || e);
     await ctx.answerCbQuery('Gagal cek stok.').catch(() => {});
@@ -3550,5 +3622,12 @@ if (backupHours > 0 && backupTarget) {
   console.log(`Auto-backup tiap ${backupHours} jam ke ${backupTarget}`);
 }
 
-process.once('SIGINT', () => { releaseLock().finally(() => { try { bot.stop('SIGINT'); } catch {} }); });
-process.once('SIGTERM', () => { releaseLock().finally(() => { try { bot.stop('SIGTERM'); } catch {} }); });
+function stopAllMenuRefresh() {
+  try {
+    for (const [, v] of lastMenu) { try { if (v?.timer) clearInterval(v.timer); } catch {} }
+    lastMenu.clear();
+  } catch {}
+}
+
+process.once('SIGINT', () => { try { stopAllMenuRefresh(); } catch {} releaseLock().finally(() => { try { bot.stop('SIGINT'); } catch {} }); });
+process.once('SIGTERM', () => { try { stopAllMenuRefresh(); } catch {} releaseLock().finally(() => { try { bot.stop('SIGTERM'); } catch {} }); });
