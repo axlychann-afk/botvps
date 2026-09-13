@@ -1525,6 +1525,43 @@ function menuCaption(name, balance, otpBal, remaining, total, percent, dot, empt
 
 const START_VIDEO_URL = process.env.START_VIDEO_URL || 'https://files.catbox.moe/sausq2.mp4';
 
+// Stiker loading: dikirim instan pas /start (biar ga keliatan hang),
+// dihapus sendiri setelah menu kekirim.
+const START_STICKER_PACK = process.env.START_STICKER_PACK || 'GerlsPacks_by_fStikBot';
+let packCache = { at: 0, ids: [] };
+async function randomPackSticker() {
+  try {
+    const now = Date.now();
+    if (!packCache.ids.length || now - packCache.at > 6 * 3600_000) {
+      const set = await bot.telegram.getStickerSet(START_STICKER_PACK);
+      const ids = (set?.stickers || []).map((s) => s?.file_id).filter(Boolean);
+      if (ids.length) packCache = { at: now, ids };
+    }
+    if (!packCache.ids.length) return null;
+    return packCache.ids[Math.floor(Math.random() * packCache.ids.length)];
+  } catch {
+    return null;
+  }
+}
+async function sendStartSticker(ctx) {
+  try {
+    const fid = await randomPackSticker();
+    if (fid) return await ctx.replyWithSticker(fid);
+  } catch {}
+  const url = process.env.START_STICKER_URL || '';
+  if (!url) return null;
+  try {
+    return await ctx.replyWithSticker({ url });
+  } catch {
+    return null;
+  }
+}
+async function dropMsg(ctx, m) {
+  try {
+    if (m?.message_id) await ctx.telegram.deleteMessage(m.chat.id, m.message_id);
+  } catch {}
+}
+
 // Menu /start: video 960x600 + teks LENGKAP + tombol, 1 pesan.
 // ANTI-SPAM: /start / cek stok BERULANG ngedit pesan menu yang sama,
 // bukan kirim baru ke bawah. ID menu disimpan (tahan restart).
@@ -1597,6 +1634,7 @@ async function sendStartMenu(ctx, name, chatId) {
 bot.start(async (ctx) => {
   // DROP duplikat: /start ganda dalam 5 detik = kirim 1 menu aja
   if (isDoubleStart(ctx.from?.id)) return;
+  const loadSticker = await sendStartSticker(ctx);
   const name = ctx.from?.first_name || 'kak';
   const chatId = getChatId(ctx);
   // GATE: wajib gabung GB Testimoni dulu sebelum menu utama muncul
@@ -1609,9 +1647,11 @@ bot.start(async (ctx) => {
       `Klik tombol di bawah untuk gabung, lalu pencet "✅ Saya Sudah Gabung".`,
       joinGateButtons()
     );
+    await dropMsg(ctx, loadSticker);
     return;
   }
   await sendStartMenu(ctx, name, chatId);
+  await dropMsg(ctx, loadSticker);
 });
 
 bot.action('cek_stok', async (ctx) => {
@@ -2483,6 +2523,7 @@ bot.action(/^cancel:(.+)$/, async (ctx) => {
 bot.action('cek_join', async (ctx) => {
   // tombol "Saya Sudah Gabung" di-spam 2x = 1 menu aja
   if (isDoubleStart(`join:${ctx.from?.id}`)) { await ctx.answerCbQuery().catch(() => {}); return; }
+  const loadSticker = await sendStartSticker(ctx);
   const joined = await isJoinedTesti(ctx.from.id);
   if (!joined) {
     await ctx.answerCbQuery('Kamu belum gabung. Join dulu ya!');
@@ -2490,11 +2531,13 @@ bot.action('cek_join', async (ctx) => {
       `❌ Belum terdeteksi join.\nGabung dulu: 👉 ${config.testiLink}\nLalu pencet tombol di bawah lagi.`,
       joinGateButtons()
     ).catch(() => {});
+    await dropMsg(ctx, loadSticker);
     return;
   }
   await ctx.answerCbQuery('✅ Terima kasih sudah gabung!');
   const name = ctx.from?.first_name || 'kak';
   await sendStartMenu(ctx, name, getChatId(ctx));
+  await dropMsg(ctx, loadSticker);
 });
 
 // ---- Contact Admin ----
