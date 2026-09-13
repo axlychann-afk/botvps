@@ -1592,7 +1592,16 @@ function startMenuRefresh(chatId, cid, mid, name, buttons) {
 }
 async function sendStartMenu(ctx, name, chatId) {
   const key = String(chatId);
-  const { text, buttons } = await buildStart(name, chatId);
+  let text, buttons;
+  try {
+    ({ text, buttons } = await buildStart(name, chatId));
+  } catch {
+    // Jalan darurat: buildStart gagal total pun menu tetap kekirim.
+    text = `${config.shopName}\nHalo, ${name}!\nKetik /saldo buat cek saldo, /start buat menu.`;
+    buttons = Markup.inlineKeyboard([
+      [Markup.button.callback('🔄 Cek Stok', 'cek_stok')],
+    ]);
+  }
   if (START_VIDEO_URL) {
     const prev = lastMenu.get(key);
     if (prev && prev.kind === 'video') {
@@ -1605,14 +1614,19 @@ async function sendStartMenu(ctx, name, chatId) {
       } catch {}
     }
     try {
-      const sent = await ctx.replyWithVideo(
-        { url: START_VIDEO_URL },
-        {
-          caption: text.slice(0, 1024),
-          supports_streaming: true,
-          ...buttons,
-        }
-      );
+      // Kirim video dibatasi 25 dtk: kalau Telegram lemot fetch URL-nya,
+      // jangan gantung — jatuh ke teks.
+      const sent = await Promise.race([
+        ctx.replyWithVideo(
+          { url: START_VIDEO_URL },
+          {
+            caption: text.slice(0, 1024),
+            supports_streaming: true,
+            ...buttons,
+          }
+        ),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('video-timeout')), 25000)),
+      ]);
       if (sent?.message_id) {
         lastMenu.set(key, { chat: sent.chat.id, mid: sent.message_id, kind: 'video' });
         startMenuRefresh(chatId, sent.chat.id, sent.message_id, name, buttons);
@@ -1627,7 +1641,7 @@ async function sendStartMenu(ctx, name, chatId) {
       return;
     } catch {}
   }
-  const sentText = await ctx.reply(text, buttons);
+  const sentText = await ctx.reply(text, buttons).catch(() => null);
   if (sentText?.message_id) lastMenu.set(key, { chat: sentText.chat.id, mid: sentText.message_id, kind: 'text' });
 }
 
@@ -1650,7 +1664,7 @@ bot.start(async (ctx) => {
     await dropMsg(ctx, loadSticker);
     return;
   }
-  await sendStartMenu(ctx, name, chatId);
+  await sendStartMenu(ctx, name, chatId).catch(() => {});
   await dropMsg(ctx, loadSticker);
 });
 
