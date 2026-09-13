@@ -126,6 +126,10 @@ function savePendingInput() {
       panelUser: Object.fromEntries(panelWaitUsername),
       panelPay: Object.fromEntries(pendingPanelPay),
       contact: [...pendingContact],
+      // timer sengaja TIDAK disimpan (Timeout object bikin JSON circular).
+      menu: Object.fromEntries(
+        [...lastMenu].map(([k, v]) => [k, { chat: v?.chat, mid: v?.mid, kind: v?.kind === 'text' ? 'text' : 'video' }])
+      ),
     };
     writeJson(pendingInputFile, data).catch(() => {});
   } catch {}
@@ -141,6 +145,9 @@ async function loadPendingInput() {
         if (v && typeof v === 'object') pendingPanelPay.set(String(k), v);
       }
       for (const u of g.contact || []) pendingContact.add(String(u));
+      for (const [k, v] of Object.entries(g.menu || {})) {
+        if (v && v.mid && v.chat) lastMenu.set(String(k), { chat: v.chat, mid: v.mid, kind: v.kind === 'text' ? 'text' : 'video' });
+      }
     }
   } catch {}
 }
@@ -1521,14 +1528,92 @@ function menuCaption(name, balance, otpBal, remaining, total, percent, dot, empt
 
 const START_VIDEO_URL = process.env.START_VIDEO_URL || 'https://files.catbox.moe/sausq2.mp4';
 
-// Menu /start: video 960x600 + teks LENGKAP + tombol, 1 pesan.
-// ANTI-SPAM: /start / cek stok BERULANG ngedit pesan menu yang sama,
-// bukan kirim baru ke bawah. ID menu disimpan (tahan restart).
-// Caption di-refresh tiap 3 detik (stat gerak sendiri, 2 menit pertama).
-// Fallback teks bila video gagal.
-// Menu /start: video + teks lengkap + tombol, kirim baru tiap kali.
-// (Tanpa edit/refresh/stiker: simpel, pasti kekirim.)
+// Menu /start: video + teks lengkap + tombol.
+// /start BERULANG ngedit pesan yang sama (command user ga diapa-apain).
+// Auto-refresh tiap 3 detik (ping/RAM/Uptime/CPU gerak), 2 menit.
+// Pesan menu dihapus/kedaluwarsa -> dikirim BARU otomatis (ga ilang).
+// 1 timer per chat. Timer TIDAK disimpan ke disk.
+const lastMenu = new Map(); // chatKey -> { chat, mid, kind, timer? }
+function stopMenuRefresh(key) {
+  try {
+    const p = lastMenu.get(String(key));
+    if (p && p.timer) clearInterval(p.timer);
+  } catch {}
+}
+async function resendMenu(chatId, name) {
+  const key = String(chatId);
+  const { text, buttons } = await buildStart(name, chatId);
+  if (START_VIDEO_URL) {
+    try {
+      const sent = await Promise.race([
+        bot.telegram.sendVideo(
+          chatId,
+          { url: START_VIDEO_URL },
+          { caption: text.slice(0, 1024), supports_streaming: true, ...buttons }
+        ),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('video-timeout')), 25000)),
+      ]);
+      if (sent?.message_id) {
+        lastMenu.set(key, { chat: sent.chat.id, mid: sent.message_id, kind: 'video' });
+        return;
+      }
+    } catch {}
+  }
+  const sentText = await bot.telegram.sendMessage(chatId, text, { ...buttons });
+  if (sentText?.message_id) lastMenu.set(key, { chat: sentText.chat.id, mid: sentText.message_id, kind: 'text' });
+}
+function startMenuRefresh(chatId, name) {
+  const key = String(chatId);
+  stopMenuRefresh(key);
+  try {
+    let ticks = 0, fails = 0, busy = false;
+    const timer = setInterval(async () => {
+      if (busy) return;
+      busy = true;
+      ticks++;
+      if (ticks > 40) { clearInterval(timer); return; } // 40x3 dtk = 2 menit
+      try {
+        const { text, buttons } = await buildStart(name, chatId);
+        const prev = lastMenu.get(key);
+        if (prev && prev.mid) {
+          if (prev.kind === 'text' || !START_VIDEO_URL) {
+            await bot.telegram.editMessageText(prev.chat, prev.mid, undefined, text, { ...buttons });
+          } else {
+            await bot.telegram.editMessageCaption(prev.chat, prev.mid, undefined, text.slice(0, 1024), { ...buttons });
+          }
+        } else {
+          await resendMenu(chatId, name);
+          const e2 = lastMenu.get(key) || {};
+          lastMenu.set(key, { chat: e2.chat, mid: e2.mid, kind: e2.kind, timer });
+        }
+        fails = 0;
+      } catch (e) {
+        if (String(e?.message || '').includes('not modified')) { busy = false; return; }
+        console.error(`Refresh menu ${chatId} gagal (${fails + 1}/3):`, e?.message || e);
+        if (++fails >= 3) {
+          try {
+            await resendMenu(chatId, name);
+            const e3 = lastMenu.get(key) || {};
+            lastMenu.set(key, { chat: e3.chat, mid: e3.mid, kind: e3.kind, timer });
+            fails = 0;
+            ticks = 0;
+          } catch (re) {
+            console.error(`Kirim ulang menu ${chatId} gagal:`, re?.message || re);
+            clearInterval(timer);
+          }
+        }
+      }
+      busy = false;
+    }, 3000);
+    if (timer && typeof timer.unref === 'function') {
+      try { timer.unref(); } catch {}
+    }
+    const cur = lastMenu.get(key) || {};
+    lastMenu.set(key, { chat: cur.chat, mid: cur.mid, kind: cur.kind, timer });
+  } catch {}
+}
 async function sendStartMenu(ctx, name, chatId) {
+  const key = String(chatId);
   let text, buttons;
   try {
     ({ text, buttons } = await buildStart(name, chatId));
@@ -1537,6 +1622,20 @@ async function sendStartMenu(ctx, name, chatId) {
     buttons = Markup.inlineKeyboard([
       [Markup.button.callback('🔄 Cek Stok', 'cek_stok')],
     ]);
+  }
+  const prev = lastMenu.get(key);
+  if (prev && prev.mid) {
+    try {
+      if (prev.kind === 'text' || !START_VIDEO_URL) {
+        await ctx.telegram.editMessageText(prev.chat, prev.mid, undefined, text, { ...buttons });
+      } else {
+        await ctx.telegram.editMessageCaption(prev.chat, prev.mid, undefined, text.slice(0, 1024), {
+          ...buttons,
+        });
+      }
+      startMenuRefresh(chatId, name);
+      return;
+    } catch {}
   }
   if (START_VIDEO_URL) {
     try {
@@ -1551,10 +1650,20 @@ async function sendStartMenu(ctx, name, chatId) {
         ),
         new Promise((_, rej) => setTimeout(() => rej(new Error('video-timeout')), 25000)),
       ]);
-      if (sent?.message_id) return;
+      if (sent?.message_id) {
+        lastMenu.set(key, { chat: sent.chat.id, mid: sent.message_id, kind: 'video' });
+        startMenuRefresh(chatId, name);
+      }
+      return;
     } catch {}
   }
-  await ctx.reply(text, buttons).catch(() => null);
+  try {
+    const sentText = await ctx.reply(text, buttons);
+    if (sentText?.message_id) {
+      lastMenu.set(key, { chat: sentText.chat.id, mid: sentText.message_id, kind: 'text' });
+      startMenuRefresh(chatId, name);
+    }
+  } catch {}
 }
 
 bot.start(async (ctx) => {
@@ -1580,9 +1689,26 @@ bot.start(async (ctx) => {
 bot.action('cek_stok', async (ctx) => {
   try {
     const name = ctx.from?.first_name || 'kak';
-    const { text, buttons } = await buildStart(name, getChatId(ctx));
+    const chatId = getChatId(ctx);
+    const { text, buttons } = await buildStart(name, chatId);
     await ctx.answerCbQuery();
-    await ctx.reply(text, buttons);
+    const prev = lastMenu.get(String(chatId));
+    if (prev && prev.mid) {
+      try {
+        if (prev.kind === 'video') {
+          await ctx.telegram.editMessageCaption(prev.chat, prev.mid, undefined, text.slice(0, 1024), { ...buttons });
+        } else {
+          await ctx.telegram.editMessageText(prev.chat, prev.mid, undefined, text, { ...buttons });
+        }
+        startMenuRefresh(chatId, name);
+        return;
+      } catch {}
+    }
+    const sent = await ctx.reply(text, buttons);
+    if (sent?.message_id) {
+      lastMenu.set(String(chatId), { chat: sent.chat.id, mid: sent.message_id, kind: 'text' });
+      startMenuRefresh(chatId, name);
+    }
   } catch {
     await ctx.answerCbQuery('Gagal cek stok.');
   }
