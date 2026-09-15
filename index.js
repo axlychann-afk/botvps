@@ -1941,9 +1941,9 @@ bot.action('buy', async (ctx) => {
 });
 
 // ---- Deposit / Top Up Saldo ----
-// SATU KANTONG: 1 dompet buat semua (VPS, panel, nokos).
-// Topup SATU PINTU via deposit RumahOTP (sekalian ngisi pool nomor).
-// QRIS langsung (Austin) cuma buat beli VPS & panel: action 'buy', 'ppay:qris'.
+// SATU KANTONG: 1 dompet buat semua (VPS, panel).
+// Topup SATU PINTU via QRIS Austin (createQris), kredit via creditTopup kind 'topup'.
+// QRIS langsung (Austin) juga dipakai beli VPS & panel: action 'buy', 'ppay:qris'.
 
 async function getOtpBalance(chatId) {
   // Alias legacy: sekarang 1 dompet, nilainya sama dengan getBalance.
@@ -1956,54 +1956,64 @@ bot.action('topup', async (ctx) => {
     await ctx.reply(`⚠️ Wajib gabung GB Testimoni dulu sebelum top up:\n👉 ${config.testiLink}`, joinGateButtons()).catch(() => {});
     return;
   }
-  if (!nokosOn()) { await ctx.reply('❌ Top up belum aktif. Hubungi admin.'); return; }
   // SATU PINTU: pencet topup = langsung diminta ketik nominal (min 2k),
-  // masuk via deposit RumahOTP, saldo otomatis nambah 1 dompet.
-  pendingTopupCustom.set(String(getChatId(ctx)), 'otp');
+  // masuk via QRIS Austin, saldo otomatis nambah 1 dompet.
+  pendingTopupCustom.set(String(getChatId(ctx)), 'austin');
   panelWaitUsername.delete(String(getChatId(ctx)));
   try { pendingContact.delete(String(ctx.from.id)); } catch {}
   await ctx.reply(
     `➕ Top Up Saldo\n1 dompet buat semua (VPS, panel).\nKetik nominal (min Rp2.000) — mis. 2500, 10k, 25.000 — atau tap cepat di bawah:`,
     Markup.inlineKeyboard([
-      [Markup.button.callback('Rp2.000', 'topupotp:2000'), Markup.button.callback('Rp5.000', 'topupotp:5000')],
-      [Markup.button.callback('Rp10.000', 'topupotp:10000'), Markup.button.callback('Rp20.000', 'topupotp:20000')],
-      [Markup.button.callback('Rp50.000', 'topupotp:50000')],
+      [Markup.button.callback('Rp2.000', 'topup:2000'), Markup.button.callback('Rp5.000', 'topup:5000')],
+      [Markup.button.callback('Rp10.000', 'topup:10000'), Markup.button.callback('Rp20.000', 'topup:20000')],
+      [Markup.button.callback('Rp50.000', 'topup:50000')],
     ])
   );
 });
 
-async function doTopupOtpOrder(ctx, nominal) {
+async function doTopupAustinOrder(ctx, nominal) {
   if (!Number.isFinite(nominal) || nominal < MIN_TOPUP || nominal > MAX_TOPUP) {
     await ctx.reply(`❌ Minimal topup ${formatRupiah(MIN_TOPUP)}. Contoh: 2500, 10k, 25.000.`);
     return;
   }
   await withPayLock(getChatId(ctx), async () => {
   if (await refuseIfPending(ctx, getChatId(ctx))) return;
-  let dep = null;
-  try { dep = await createDeposit(nominal, 'qris'); }
+  let qris = null;
+  try { qris = await createQris(nominal); }
   catch (e) { await ctx.reply(`Gagal bikin QRIS: ${e.message}`); return; }
   const chatId = getChatId(ctx);
   const order = {
     id: randomUUID(),
-    kind: 'otp_topup',
+    kind: 'topup',
+    provider: 'austin',
     chatId,
     buyerName: ctx.from?.first_name || '',
-    reference: dep.id,
+    reference: qris.reference,
     createdAt: Date.now(),
-    expiredAt: dep.expired_at,
-    total: dep.total,
-    amount: dep.diterima || nominal,
+    expiredAt: qris.expiredAt,
+    total: qris.total,
+    amount: qris.nominal || nominal,
     status: 'pending',
   };
   const orders = await readJson(ordersFile);
   orders[order.id] = order;
   await writeJson(ordersFile, orders);
   startPolling(order.id);
-  const qris = { image: dep.qr_image, reference: dep.id };
   await sendQrisPhoto(ctx, qris, order,
-    `📱 Top up Saldo ${formatRupiah(dep.diterima || nominal)} lewat QR ini.\nBayar ${formatRupiah(dep.total)} (termasuk fee).\n\nDeposit: ${dep.id}\n${qrisExpiryText({ expiredAt: dep.expired_at })}`);
+    `💰 Top up Saldo ${formatRupiah(qris.nominal || nominal)} lewat QR ini.\nBayar ${formatRupiah(qris.total)} (termasuk fee).\n\nRef: ${qris.reference}\n${qrisExpiryText({ expiredAt: qris.expiredAt })}`);
   });
 }
+
+// Alias legacy: tombol QR lama (topupotp:*) di riwayat chat tetap nyala,
+// dialihkan ke jalur Austin yang baru.
+async function doTopupOtpOrder(ctx, nominal) {
+  return doTopupAustinOrder(ctx, nominal);
+}
+
+bot.action(/^topup:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  await doTopupAustinOrder(ctx, Number(ctx.match[1]));
+});
 
 bot.action(/^topupotp:(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
@@ -2012,8 +2022,7 @@ bot.action(/^topupotp:(\d+)$/, async (ctx) => {
 
 bot.action(/^topup_custom:(vps|otp)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  if (!nokosOn()) { await ctx.reply('❌ Top up belum aktif. Hubungi admin.'); return; }
-  pendingTopupCustom.set(String(getChatId(ctx)), 'otp');
+  pendingTopupCustom.set(String(getChatId(ctx)), 'austin');
   panelWaitUsername.delete(String(getChatId(ctx)));
   try { pendingContact.delete(String(ctx.from.id)); } catch {}
   await ctx.reply(
@@ -2021,7 +2030,8 @@ bot.action(/^topup_custom:(vps|otp)$/, async (ctx) => {
   );
 });
 
-// Kredit topup jalur OTP (deposit RumahOTP) — masuk ke 1 dompet yang sama.
+// Kredit topup legacy jalur OTP (deposit RumahOTP lama) — order pending lawas
+// tetap bisa dikredit biar ga macet. Order BARU selalu kind 'topup' via Austin.
 async function creditOtpTopup(orderId) {
   const orders = await readJson(ordersFile);
   const order = orders[orderId];
@@ -2038,13 +2048,13 @@ async function creditOtpTopup(orderId) {
   } catch {}
   try {
     await notifyAdmins(
-      `📱 Topup via OTP!\n👤 ${order.buyerName || 'User'} (${order.chatId})\n💰 ${formatRupiah(order.amount)} (bayar ${formatRupiah(order.total)})\n💰 Saldo user: ${formatRupiah(total)}\nRef: ${order.reference}`
+      `💰 Top Up Saldo!\n👤 ${order.buyerName || 'User'} (${order.chatId})\n💰 ${formatRupiah(order.amount)} (bayar ${formatRupiah(order.total)})\n💰 Saldo user: ${formatRupiah(total)}\nRef: ${order.reference}`
     );
   } catch {}
   try {
     await sendTesti('topup', {
       name: order.buyerName || 'Pembeli',
-      detail: 'Top Up Saldo via OTP',
+      detail: 'Top Up Saldo via QRIS',
       amount: formatRupiah(order.amount),
       ref: order.reference || order.id,
     });
@@ -2060,7 +2070,7 @@ async function checkDeposit(order) {
   return depositPaid(dep);
 }
 
-// QRIS langsung khusus beli VPS & panel (Austin) ada di action 'buy' dan 'ppay:qris'.
+// QRIS langsung (Austin) buat topup saldo, beli VPS & panel.
 
 // ---- Beli pakai saldo ----
 bot.action('buy_balance', async (ctx) => {
@@ -2830,9 +2840,8 @@ bot.on('text', async (ctx, next) => {
       return;
     }
     pendingTopupCustom.delete(chatKey);
-    if (!nokosOn()) { await ctx.reply('❌ Top up belum aktif. Hubungi admin.'); return; }
     try {
-      await doTopupOtpOrder(ctx, nominal);
+      await doTopupAustinOrder(ctx, nominal);
     } catch (e) {
       await ctx.reply(`❌ Gagal bikin QRIS: ${e?.message || e}. Coba lagi atau /batal.`);
     }
