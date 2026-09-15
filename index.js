@@ -1529,7 +1529,7 @@ async function buildStart(name, chatId, tickInfo = null) {
     ? [[Markup.button.callback('🔄 Cek Stok', 'cek_stok')]]
     : [
         [Markup.button.callback(`🛒 Beli VPS • ${formatRupiah(PRICE)}`, 'buy')],
-        [Markup.button.callback('📱 Beli Nokos (OTP)', 'nokos'), Markup.button.callback('💰 VPS via Saldo', 'buy_balance')],
+        [Markup.button.callback('💰 VPS via Saldo', 'buy_balance')],
         [Markup.button.callback('💳 Saldo Saya', 'saldo'), Markup.button.callback('➕ Top Up', 'topup')],
         [Markup.button.callback('🛡️ Panel Legal — Garansi 30 Hari', 'panel_legal')],
       ];
@@ -1821,7 +1821,7 @@ async function showSaldo(ctx) {
   const balance = await getBalance(chatId);
   await ctx.reply(
     `💰 Saldo  :  ${formatRupiah(balance)}\n` +
-    `1 VPS = ${formatRupiah(PRICE)}. Nokos mulai ~Rp1.600, panel mulai Rp1.000 — semua potong saldo ini.`,
+    `1 VPS = ${formatRupiah(PRICE)}. Panel mulai Rp1.000 — semua potong saldo ini.`,
     Markup.inlineKeyboard([
       [Markup.button.callback('➕ Top Up Saldo', 'topup')],
       [Markup.button.callback(`💰 Beli 1 VPS — ${formatRupiah(PRICE)}`, 'buy_balance')],
@@ -1963,7 +1963,7 @@ bot.action('topup', async (ctx) => {
   panelWaitUsername.delete(String(getChatId(ctx)));
   try { pendingContact.delete(String(ctx.from.id)); } catch {}
   await ctx.reply(
-    `➕ Top Up Saldo\n1 dompet buat semua (VPS, panel, nokos).\nKetik nominal (min Rp2.000) — mis. 2500, 10k, 25.000 — atau tap cepat di bawah:`,
+    `➕ Top Up Saldo\n1 dompet buat semua (VPS, panel).\nKetik nominal (min Rp2.000) — mis. 2500, 10k, 25.000 — atau tap cepat di bawah:`,
     Markup.inlineKeyboard([
       [Markup.button.callback('Rp2.000', 'topupotp:2000'), Markup.button.callback('Rp5.000', 'topupotp:5000')],
       [Markup.button.callback('Rp10.000', 'topupotp:10000'), Markup.button.callback('Rp20.000', 'topupotp:20000')],
@@ -2033,7 +2033,7 @@ async function creditOtpTopup(orderId) {
   try {
     await bot.telegram.sendMessage(
       order.chatId,
-      `✅ Top up ${formatRupiah(order.amount)} berhasil!\n💰 Saldo kamu: ${formatRupiah(total)}\nPilih /nokos buat beli nomor, /start buat VPS/panel.`
+      `✅ Top up ${formatRupiah(order.amount)} berhasil!\n💰 Saldo kamu: ${formatRupiah(total)}\nPilih /start buat VPS/panel.`
     );
   } catch {}
   try {
@@ -2309,26 +2309,12 @@ function nokosFavRows() {
 }
 
 bot.command('nokos', async (ctx) => {
-  if (!nokosOn()) { await ctx.reply('❌ Fitur nokos belum aktif. Hubungi admin.'); return; }
-  const mine = await nokosActiveList(getChatId(ctx));
-  await ctx.reply(
-    `📱 Nokos OTP — semua layanan + semua negara\nAktif kamu: ${mine.length}/${config.nokosMaxActive}\n${mine.map((o) => `• ${o.serviceLabel} ${o.phone} (${o.roOrderId})`).join('\n')}\n\nJalur cepat atau browser lengkap:`,
-    Markup.inlineKeyboard([...nokosFavRows(), [Markup.button.callback('🔍 Semua layanan', 'nks:0')]])
-  );
+  await ctx.reply('❌ Maaf, penjualan nokos sudah ditutup. Silakan order VPS/panel via /start.');
 });
 
 bot.action('nokos', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  if (!nokosOn()) { await ctx.reply('❌ Fitur nokos belum aktif.'); return; }
-  if (!(await isJoinedTesti(ctx.from.id))) {
-    await ctx.reply(`⚠️ Wajib gabung GB Testimoni dulu:\n👉 ${config.testiLink}`, joinGateButtons()).catch(() => {});
-    return;
-  }
-  const mine = await nokosActiveList(getChatId(ctx));
-  await ctx.reply(
-    `📱 Nokos OTP (aktif: ${mine.length}/${config.nokosMaxActive})\nPilih jalur cepat atau browser lengkap:`,
-    Markup.inlineKeyboard([...nokosFavRows(), [Markup.button.callback('🔍 Semua layanan', 'nks:0')]])
-  );
+  await ctx.reply('❌ Maaf, penjualan nokos sudah ditutup. Silakan order VPS/panel via /start.');
 });
 
 // ---- Browser services (paging, ratusan service) ----
@@ -3135,8 +3121,7 @@ bot.command('admin', async (ctx) => {
     `/bcunblock <nomor> — buka block\n` +
     `/stok — cek stok\n` +
     `/tambahstok — tambah stok\n` +
-    `/tambahsaldo <id> <nominal> — tambah saldo user\n` +
-     `/nokosaldo — cek saldo stok nomor\n` +
+     `/tambahsaldo <id> <nominal> — tambah saldo user\n` +
     `/riwayat [n] — order terakhir\n` +
     `/balas <id> <pesan> — balas pesan user (contact)\n` +
     `/spek — kartu spek VPS\n\n` +
